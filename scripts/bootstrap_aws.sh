@@ -59,6 +59,19 @@ pick_python() {
 require_cmd aws
 PYTHON="$(pick_python)"
 
+# When running under Git Bash on Windows, the bash side uses /tmp/... paths
+# that the native Windows aws CLI cannot resolve. cygpath -w translates
+# /tmp/foo to C:\Users\you\AppData\Local\Temp\foo. On real Linux, cygpath
+# does not exist; in that case the path is already native-correct and we
+# return it unchanged.
+aws_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    echo "$1"
+  fi
+}
+
 verify_account() {
   local actual
   actual="$(aws sts get-caller-identity --query Account --output text)"
@@ -107,7 +120,7 @@ apply_public_policy() {
     --strip-comment \
     --replace "BUCKET_NAME=$name" > "$tmpfile"
   log "applying public-read policy to: $name"
-  aws s3api put-bucket-policy --bucket "$name" --policy "file://$tmpfile"
+  aws s3api put-bucket-policy --bucket "$name" --policy "file://$(aws_path "$tmpfile")"
   rm -f "$tmpfile"
 }
 
@@ -139,13 +152,13 @@ ensure_iam_user() {
     fi
     aws iam create-policy-version \
       --policy-arn "$policy_arn" \
-      --policy-document "file://$tmpfile" \
+      --policy-document "file://$(aws_path "$tmpfile")" \
       --set-as-default >/dev/null
   else
     log "creating iam policy: $IAM_POLICY"
     aws iam create-policy \
       --policy-name "$IAM_POLICY" \
-      --policy-document "file://$tmpfile" >/dev/null
+      --policy-document "file://$(aws_path "$tmpfile")" >/dev/null
   fi
 
   log "attaching policy to user: $IAM_USER"
@@ -158,7 +171,8 @@ ensure_iam_user() {
 
 create_bandwidth_alarm() {
   local name="$1"
-  local alarm="csd-benchmark-${name}-bytes-out"
+  # name already includes the csd-benchmark- prefix; just append the suffix.
+  local alarm="${name}-bytes-out"
   log "creating CloudWatch alarm: $alarm (threshold ${ALARM_THRESHOLD_BYTES} bytes/hr)"
   aws cloudwatch put-metric-alarm \
     --alarm-name "$alarm" \
@@ -192,7 +206,7 @@ create_inventory_bucket() {
     --strip-comment \
     --replace "BUCKET_NAME=$BUCKET_INVENTORY" > "$tmpfile"
   log "applying inventory destination policy to: $BUCKET_INVENTORY"
-  aws s3api put-bucket-policy --bucket "$BUCKET_INVENTORY" --policy "file://$tmpfile"
+  aws s3api put-bucket-policy --bucket "$BUCKET_INVENTORY" --policy "file://$(aws_path "$tmpfile")"
   rm -f "$tmpfile"
 }
 
@@ -209,7 +223,7 @@ apply_inventory_config() {
   aws s3api put-bucket-inventory-configuration \
     --bucket "$source_bucket" \
     --id "$INVENTORY_CONFIG_ID" \
-    --inventory-configuration "file://$tmpfile"
+    --inventory-configuration "file://$(aws_path "$tmpfile")"
   rm -f "$tmpfile"
 }
 
