@@ -1,0 +1,20 @@
+# Selenium for CSD and AWS Console runners.
+selenium>=4.20.0
+
+# selenium-wire captures network traffic for the HTTP request count and
+# bytes-transferred metrics. It also writes HAR files for the run archive.
+selenium-wire>=5.1.0
+
+# webdriver-manager auto-fetches chromedriver matching the local Chrome.
+webdriver-manager>=4.0.1
+
+# AWS CLI runner uses boto3 only for setup/cleanup; the runs themselves shell
+# out to `aws s3` so we measure the same CLI a customer would use.
+boto3>=1.34.0
+botocore>=1.34.0
+
+# YAML config (matches csd-benchmark seeders).
+PyYAML>=6.0.1
+
+# CSV/results helpers.
+# Standard library is fine; nothing extra needed here.

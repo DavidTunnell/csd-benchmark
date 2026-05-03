@@ -68,7 +68,30 @@ Steps:
    python generate_inventory.py --bucket flat
    ```
 
-After step 6 the buckets are ready for the benchmark harnesses.
+After step 6 the buckets are ready for the benchmark harness in `harness/`.
+
+## Running the harness
+
+The harness drives the five scenarios across CloudSee Drive, the AWS Console, and the AWS CLI, captures per-run metrics, and emits a markdown report.
+
+```bash
+cd harness
+python -m pip install -r requirements.txt
+
+# walk the matrix without running anything
+python -m harness.run_matrix --dry-run
+
+# 10 runs of scenario 3, cold cache, against CSD only
+python -m harness.run_matrix --tool csd --scenario 3 --cache cold --runs 10
+
+# the official run group
+python -m harness.run_matrix --tool all --scenario all --cache all --runs 10
+
+# aggregate one or more result CSVs into a markdown report
+python -m harness.report results/run-*.csv --out results/report.md
+```
+
+Architectural decisions (auth replay, selectors, human handoff, correctness rubrics, aggregation) are documented in [`harness/README.md`](harness/README.md). Per-scenario rubrics are in [`harness/RUN_MATRIX.md`](harness/RUN_MATRIX.md).
 
 ## Layout
 
@@ -91,6 +114,21 @@ csd-benchmark/
     inventory-config.json               # native S3 Inventory daily report (backup to our sidecar)
   scripts/
     bootstrap_aws.sh        # one-shot AWS setup
+  harness/
+    README.md               # locked architectural decisions
+    RUN_MATRIX.md           # per-scenario correctness rubrics
+    requirements.txt
+    run_matrix.py           # orchestrator (CLI)
+    config.py, scenarios.py, results.py, common.py
+    auth_state.py           # capture-and-replay browser session
+    selectors.py            # find_by_intent, data-testid > aria-label > CSS
+    operator.py             # hotkey wait + click counter
+    report.py               # CSV to markdown aggregator
+    tools/
+      base.py
+      csd_runner.py         # drives drive.cloudsee.cloud (Selenium)
+      console_runner.py     # drives console.aws.amazon.com (Selenium + manual handoff)
+      cli_runner.py         # times aws s3 commands
   results/                  # benchmark output, populated in P6
 ```
 

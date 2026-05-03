@@ -35,3 +35,11 @@ sources/
 # AWS credential files
 .aws/
 credentials
+
+# Harness-specific
+*.har
+*.png
+*.jpg
+*.mp4
+chrome-profile/
+.selenium/
