@@ -6,12 +6,13 @@ This repo holds the seeders that build the benchmark buckets, the infra config, 
 
 ## What gets built
 
-Two public S3 buckets in account `592920047652`, region `us-east-1`:
+Three S3 buckets in account `592920047652`, region `us-east-1`:
 
-| Bucket | Contents | Used by |
-| :---- | :---- | :---- |
-| `csd-benchmark-flat-150k` | 150,000 synthetic flat objects with a known target at lexical index ~149,500 | Scenario 1 |
-| `csd-benchmark-oss-mirror` | Linux v6.10, Kubernetes v1.36.0, React v19.2.5, TensorFlow v2.20.0 at real paths, plus `_meta/inventory-*.csv` sidecars and `domain=audio` tags on a documented subset | Scenarios 2, 3, 4, 5 |
+| Bucket | Visibility | Contents | Used by |
+| :---- | :---- | :---- | :---- |
+| `csd-benchmark-flat-150k` | Public-read | 150,000 synthetic flat objects with a known target at lexical index ~149,500 | Scenario 1 |
+| `csd-benchmark-oss-mirror` | Public-read | Linux v6.10, Kubernetes v1.36.0, React v19.2.5, TensorFlow v2.20.0 at real paths, plus `_meta/inventory-*.csv` sidecars and `domain=audio` tags on a documented subset | Scenarios 2, 3, 4, 5 |
+| `csd-benchmark-inventory-reports` | Private | Native S3 Inventory daily CSV reports for both source buckets, written by the S3 service. Used as a backup/audit trail for the `_meta/` sidecars that scenarios actually read from. | Internal verification |
 
 Source-mtime is preserved as object metadata using each project's HEAD commit timestamp at the pinned tag, so Scenario 4 (date-range search) has real, defensible values.
 
@@ -84,9 +85,10 @@ csd-benchmark/
     generate_inventory.py   # writes _meta/inventory-{bucket}.csv sidecars
     requirements.txt
   infra/
-    bucket-policy.json      # public-read template
-    iam-readonly-user.json  # benchmark IAM user policy
-    inventory-config.json   # native S3 Inventory daily report (backup to our sidecar)
+    bucket-policy.json                  # public-read template (flat + oss buckets)
+    inventory-dest-bucket-policy.json   # private inventory bucket policy, allows only S3 service writes
+    iam-readonly-user.json              # benchmark IAM user policy
+    inventory-config.json               # native S3 Inventory daily report (backup to our sidecar)
   scripts/
     bootstrap_aws.sh        # one-shot AWS setup
   results/                  # benchmark output, populated in P6

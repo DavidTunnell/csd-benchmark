@@ -1,9 +1,9 @@
 {
-  "_comment": "Native S3 Inventory configuration for csd-benchmark buckets. Provides daily CSV reports of all objects, used as a reproducibility backup to our generated _meta/inventory-*.csv sidecar. Replace BUCKET_NAME and INVENTORY_DEST_BUCKET at apply time.",
+  "_comment": "Native S3 Inventory configuration for csd-benchmark buckets. Provides daily CSV reports of all objects, used as a reproducibility backup to our generated _meta/inventory-*.csv sidecar. Destination is csd-benchmark-inventory-reports. Replace BUCKET_NAME (the source bucket prefix segment) at apply time via bootstrap_aws.sh.",
   "Destination": {
     "S3BucketDestination": {
       "AccountId": "592920047652",
-      "Bucket": "arn:aws:s3:::INVENTORY_DEST_BUCKET",
+      "Bucket": "arn:aws:s3:::csd-benchmark-inventory-reports",
       "Format": "CSV",
       "Prefix": "inventory/BUCKET_NAME/"
     }

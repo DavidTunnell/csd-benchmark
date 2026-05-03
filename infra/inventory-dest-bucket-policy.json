@@ -1,0 +1,27 @@
+{
+  "_comment": "Bucket policy for csd-benchmark-inventory-reports. Allows the S3 service principal to write daily Inventory reports for the two benchmark source buckets, and only those buckets. The aws:SourceAccount and aws:SourceArn conditions enforce the confused-deputy protection AWS recommends. The Webapper account retains full read access via standard IAM (no statement needed here for that). Replace BUCKET_NAME at apply time via bootstrap_aws.sh.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowS3InventoryWrite",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "s3.amazonaws.com"
+      },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::BUCKET_NAME/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceAccount": "592920047652"
+        },
+        "ArnLike": {
+          "aws:SourceArn": [
+            "arn:aws:s3:::csd-benchmark-flat-150k",
+            "arn:aws:s3:::csd-benchmark-oss-mirror"
+          ]
+        }
+      }
+    }
+  ]
+}

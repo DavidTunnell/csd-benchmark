@@ -5,8 +5,10 @@
 # Creates (idempotent where AWS allows):
 #   1. Two S3 buckets: csd-benchmark-flat-150k, csd-benchmark-oss-mirror
 #   2. Public block disabled + public-read bucket policy on each
-#   3. IAM user csd-benchmark-readonly with the policy in infra/iam-readonly-user.json
-#   4. CloudWatch alarm on bucket BytesDownloaded (mitigates the public-read bandwidth risk in spec)
+#   3. Third S3 bucket: csd-benchmark-inventory-reports (PRIVATE) for native S3 Inventory output
+#   4. IAM user csd-benchmark-readonly with the policy in infra/iam-readonly-user.json
+#   5. CloudWatch alarm on bucket BytesDownloaded (mitigates the public-read bandwidth risk in spec)
+#   6. S3 Inventory configuration on each source bucket, daily, written to the reports bucket
 #
 # Designed to run once per fresh sandbox. Re-running is safe: every step
 # checks for existing resources before creating.
@@ -23,9 +25,11 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID_EXPECTED="592920047652"
 BUCKET_FLAT="csd-benchmark-flat-150k"
 BUCKET_OSS="csd-benchmark-oss-mirror"
+BUCKET_INVENTORY="csd-benchmark-inventory-reports"
 IAM_USER="csd-benchmark-readonly"
 IAM_POLICY="csd-benchmark-readonly-policy"
 ALARM_THRESHOLD_BYTES=$((50 * 1024 * 1024 * 1024))  # 50 GB
+INVENTORY_CONFIG_ID="csd-benchmark-daily-inventory"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INFRA_DIR="$REPO_ROOT/infra"
@@ -155,6 +159,45 @@ create_bandwidth_alarm() {
     --treat-missing-data notBreaching
 }
 
+# ----- Inventory destination bucket (private) -----
+
+create_inventory_bucket() {
+  create_bucket "$BUCKET_INVENTORY"
+
+  # Stays private. Default S3 public access block is left ON.
+  log "ensuring public access block is ENFORCED on: $BUCKET_INVENTORY"
+  aws s3api put-public-access-block \
+    --bucket "$BUCKET_INVENTORY" \
+    --public-access-block-configuration \
+      "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+  local tmpfile
+  tmpfile="$(mktemp)"
+  jq --arg b "$BUCKET_INVENTORY" \
+     '. | del(._comment) | (.Statement[].Resource) |= gsub("BUCKET_NAME"; $b)' \
+     "$INFRA_DIR/inventory-dest-bucket-policy.json" > "$tmpfile"
+  log "applying inventory destination policy to: $BUCKET_INVENTORY"
+  aws s3api put-bucket-policy --bucket "$BUCKET_INVENTORY" --policy "file://$tmpfile"
+  rm -f "$tmpfile"
+}
+
+# ----- Apply S3 Inventory configuration to a source bucket -----
+
+apply_inventory_config() {
+  local source_bucket="$1"
+  local tmpfile
+  tmpfile="$(mktemp)"
+  jq --arg b "$source_bucket" \
+     '. | del(._comment) | .Destination.S3BucketDestination.Prefix = ("inventory/" + $b + "/")' \
+     "$INFRA_DIR/inventory-config.json" > "$tmpfile"
+  log "applying S3 Inventory config on: $source_bucket -> s3://$BUCKET_INVENTORY/inventory/$source_bucket/"
+  aws s3api put-bucket-inventory-configuration \
+    --bucket "$source_bucket" \
+    --id "$INVENTORY_CONFIG_ID" \
+    --inventory-configuration "file://$tmpfile"
+  rm -f "$tmpfile"
+}
+
 main() {
   verify_account
 
@@ -163,6 +206,16 @@ main() {
     unblock_public_access "$bucket"
     apply_public_policy "$bucket"
     create_bandwidth_alarm "$bucket"
+  done
+
+  # Inventory destination bucket must exist and have a policy that lets the
+  # S3 service write into it before we attach inventory configs to the source
+  # buckets. Order matters - PutBucketInventoryConfiguration validates the
+  # destination is writeable.
+  create_inventory_bucket
+
+  for bucket in "$BUCKET_FLAT" "$BUCKET_OSS"; do
+    apply_inventory_config "$bucket"
   done
 
   ensure_iam_user
@@ -175,6 +228,7 @@ main() {
   log "  4. python tag_audio_files.py        # < 1 min"
   log "  5. python generate_inventory.py --bucket oss_mirror"
   log "  6. python generate_inventory.py --bucket flat"
+  log "  Note: native S3 Inventory takes ~24h for first delivery to s3://$BUCKET_INVENTORY/"
 }
 
 main "$@"
