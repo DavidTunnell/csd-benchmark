@@ -1,0 +1,20 @@
+{
+  "_comment": "Public-read policy for csd-benchmark buckets. The reproduction story requires anyone to list and get objects without an AWS account. We do NOT grant write or delete to anyone but the seeder identity. Replace BUCKET_NAME at apply time via bootstrap_aws.sh.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadAndList",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectTagging",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::BUCKET_NAME",
+        "arn:aws:s3:::BUCKET_NAME/*"
+      ]
+    }
+  ]
+}

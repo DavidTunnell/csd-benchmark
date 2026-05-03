@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local OSS clones used during seeding
+.work/
+sources/
+*.tar.gz
+
+# Local results/logs (official runs go in results/, not here)
+*.log
+.local/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# AWS credential files
+.aws/
+credentials

@@ -1,0 +1,31 @@
+{
+  "_comment": "Read-only policy for the csd-benchmark-readonly IAM user. Used by AWS Console and AWS CLI runs of the benchmark, per spec section 'Run conditions'. No MFA per spec. Scoped to the two benchmark buckets only.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadBenchmarkBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectTagging",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketTagging"
+      ],
+      "Resource": [
+        "arn:aws:s3:::csd-benchmark-flat-150k",
+        "arn:aws:s3:::csd-benchmark-flat-150k/*",
+        "arn:aws:s3:::csd-benchmark-oss-mirror",
+        "arn:aws:s3:::csd-benchmark-oss-mirror/*"
+      ]
+    },
+    {
+      "Sid": "ListAllBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

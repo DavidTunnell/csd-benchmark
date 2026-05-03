@@ -1,0 +1,91 @@
+# csd-benchmark seed configuration
+# Single source of truth for everything reproducible. Change values here, not in scripts.
+
+aws:
+  account_id: "592920047652"   # Webapper sandbox
+  region: us-east-1
+
+buckets:
+  flat:
+    name: csd-benchmark-flat-150k
+    object_count: 150000
+    target_index: 149500       # Scenario 1 target lands at this lexical position
+    target_filename: needle-quarterly-report-2024-Q4.pdf
+    object_size_bytes: 1024    # ~1KB padding per object
+    public_read: true
+
+  oss_mirror:
+    name: csd-benchmark-oss-mirror
+    public_read: true
+
+# OSS sources mirrored into the oss_mirror bucket.
+# All four go under their own prefix at the bucket root.
+oss_sources:
+  - name: linux
+    prefix: linux/v6.10/
+    git_url: https://github.com/torvalds/linux.git
+    git_ref: v6.10
+    # Scenario 2 target file, must exist after seeding
+    scenario_2_target: linux/v6.10/arch/arm64/boot/dts/freescale/imx8mq-evk.dts
+
+  - name: kubernetes
+    prefix: kubernetes/v1.36.0/
+    git_url: https://github.com/kubernetes/kubernetes.git
+    git_ref: v1.36.0
+
+  - name: react
+    prefix: react/v19.2.5/
+    git_url: https://github.com/facebook/react.git
+    git_ref: v19.2.5
+
+  - name: tensorflow
+    prefix: tensorflow/v2.20.0/
+    git_url: https://github.com/tensorflow/tensorflow.git
+    git_ref: v2.20.0
+
+# Scenario 3 expectation: substring search 'bluetooth' should hit 200+ matches across all four projects.
+# We assert this in seed_oss_mirror.py before declaring seeding complete.
+scenario_3:
+  substring: bluetooth
+  min_matches: 200
+
+# Scenario 4 expectation: at least N files with source-mtime in the documented date range.
+# Range matches the spec. Driven by git commit timestamps captured during upload.
+scenario_4:
+  date_range_start: "2020-01-01T00:00:00Z"
+  date_range_end:   "2020-12-31T23:59:59Z"
+  min_matches: 50
+
+# Scenario 5: tag domain=audio applied to objects whose key matches any of these glob patterns.
+# Patterns are matched with fnmatch against the full S3 key (no leading slash).
+scenario_5:
+  tag_key: domain
+  tag_value: audio
+  path_patterns:
+    - "linux/v6.10/sound/**"
+    - "linux/v6.10/Documentation/sound/**"
+    - "linux/v6.10/include/sound/**"
+    - "linux/v6.10/include/uapi/sound/**"
+    - "tensorflow/v2.20.0/tensorflow/python/ops/signal/**"
+    - "tensorflow/v2.20.0/tensorflow/python/ops/audio_ops*"
+    - "tensorflow/v2.20.0/tensorflow/core/kernels/audio_*"
+    - "tensorflow/v2.20.0/tensorflow/core/api_def/base_api/api_def_Audio*"
+  min_matches: 100
+
+# Inventory CSV sidecar. Lives inside each bucket under _meta/.
+# Used by Scenario 4 to filter by source-mtime when the Console can't do it natively.
+inventory:
+  prefix: _meta/
+  oss_filename: inventory-oss-mirror.csv
+  flat_filename: inventory-flat-150k.csv
+
+# IAM read-only user that Console + CLI runs use. No MFA per spec.
+iam:
+  username: csd-benchmark-readonly
+  policy_name: csd-benchmark-readonly-policy
+
+# Bandwidth alarm (mitigation for the public-read risk flagged in spec).
+# Triggers when bucket bytes-out exceeds threshold over a 1-hour window.
+cloudwatch:
+  bytes_out_alarm_threshold_gb: 50
+  alarm_period_seconds: 3600
