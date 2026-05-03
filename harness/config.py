@@ -45,8 +45,11 @@ class IamCreds:
 
     @classmethod
     def from_env(cls) -> "IamCreds":
-        ak = os.environ["CSD_BENCHMARK_AWS_ACCESS_KEY_ID"]
-        sk = os.environ["CSD_BENCHMARK_AWS_SECRET_ACCESS_KEY"]
+        # Empty strings signal "use ambient AWS config" - the boto3/aws-cli
+        # default credential provider chain (env vars, AWS_PROFILE, ~/.aws/credentials,
+        # instance metadata) takes over. CliRunner.setup() honors this contract.
+        ak = os.environ.get("CSD_BENCHMARK_AWS_ACCESS_KEY_ID", "")
+        sk = os.environ.get("CSD_BENCHMARK_AWS_SECRET_ACCESS_KEY", "")
         return cls(ak, sk)
 
 

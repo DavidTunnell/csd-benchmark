@@ -43,13 +43,16 @@ class CliRunner(Runner):
         self._env = None
 
     def setup(self) -> None:
-        # Use a clean env slice so we don't accidentally inherit ambient
-        # AWS_PROFILE that points at a different account.
         env = dict(os.environ)
-        env.pop("AWS_PROFILE", None)
-        env["AWS_ACCESS_KEY_ID"] = self.creds.access_key_id
-        env["AWS_SECRET_ACCESS_KEY"] = self.creds.secret_access_key
-        env["AWS_REGION"] = "us-east-1"
+        if self.creds.access_key_id and self.creds.secret_access_key:
+            # Explicit creds override ambient. Clean AWS_PROFILE so it doesn't
+            # silently route us to a different account.
+            env.pop("AWS_PROFILE", None)
+            env["AWS_ACCESS_KEY_ID"] = self.creds.access_key_id
+            env["AWS_SECRET_ACCESS_KEY"] = self.creds.secret_access_key
+        else:
+            log.info("no explicit IAM creds in env; using ambient AWS config")
+        env.setdefault("AWS_REGION", "us-east-1")
         self._env = env
         _aws_path()  # sanity check
 

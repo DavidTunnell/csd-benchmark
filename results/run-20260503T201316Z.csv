@@ -1,0 +1,13 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,cold,technical,1.0545328999869525,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,cold,technical,0.9805120000091847,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,cold,technical,0.9689036999770906,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,warm,technical,0.9501715000078548,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,warm,technical,0.9296411999966949,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,1,flat-bucket-target-deep,warm,technical,0.9388375999988057,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,cold,technical,1.0186945000023115,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,cold,technical,0.9333860999904573,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,cold,technical,0.9445007000176702,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,warm,technical,0.9327376000001095,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,warm,technical,0.9131717999989633,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T201316Z,,cli,2,six-folders-deep,warm,technical,0.957978299993556,0,,,,true,false,true,,"stub run, partial automation"
