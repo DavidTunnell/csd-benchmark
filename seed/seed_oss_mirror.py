@@ -105,9 +105,15 @@ def iter_archive_entries(repo_dir: Path, git_ref: str) -> Iterable[tuple[str, by
     Python's tarfile module. Symlinks, directories, and non-regular entries
     are skipped. Path separators in tar entries are always forward slashes,
     which is what we want for S3 keys.
+
+    -c core.protectNTFS=false is required on Windows. The Linux kernel
+    contains drivers/gpu/drm/nouveau/nvkm/subdev/i2c/aux.c, and AUX is a
+    Windows reserved name; with the default protectNTFS=true Git refuses to
+    even stream that path through `git archive`. The flag affects only
+    Windows-targeted name validation, never disk writes (we never extract).
     """
     proc = subprocess.Popen(
-        ["git", "archive", "--format=tar", git_ref],
+        ["git", "-c", "core.protectNTFS=false", "archive", "--format=tar", git_ref],
         cwd=str(repo_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
