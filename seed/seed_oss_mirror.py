@@ -1,9 +1,15 @@
 """Seed the csd-benchmark-oss-mirror bucket from four OSS projects.
 
+Streaming, working-tree-free design so seeding works on Windows. The Linux
+kernel contains a file at drivers/gpu/drm/nouveau/nvkm/subdev/i2c/aux.c -
+"AUX" is a Windows reserved name and cannot be created on NTFS. We avoid
+the issue by never writing source files to disk.
+
 For each project in config.yaml/oss_sources:
-  1. Shallow-clone (or update) the repo at the pinned tag into .work/.
-  2. Walk the working tree.
-  3. For each file, upload to S3 under the project's prefix with metadata:
+  1. Clone the repo at the pinned tag with --no-checkout (working tree empty).
+  2. Run `git archive HEAD --format=tar` and stream the result through
+     Python's tarfile module.
+  3. For each file member, upload to S3 under the project's prefix with metadata:
        source-mtime: <ISO 8601 timestamp from the commit at git_ref>
   4. Idempotent: if an object already exists with a matching ETag, skip upload.
 
@@ -13,21 +19,22 @@ After upload, we assert the post-conditions from config.yaml:
   - Scenario 4 date range yields at least min_matches files (by source-mtime).
 
 Usage:
-    python seed_oss_mirror.py [--dry-run] [--only PROJECT] [--limit N]
+    python seed_oss_mirror.py [--dry-run] [--only PROJECT] [--limit N] [--skip-checks]
 
 This script is human-supervised. It does not run AWS calls until you give it
 real credentials via environment variables. Use --dry-run to validate the
-local clone + walk without touching AWS.
+clone + archive walk without touching AWS.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
 import hashlib
-import os
+import io
+import subprocess
 import sys
+import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
@@ -39,27 +46,24 @@ from common import Config, SeedingError, get_logger, run_cmd, workdir
 
 log = get_logger("seed_oss_mirror")
 
-# Files we never upload. These are runtime/repo artifacts, not source content.
-SKIP_DIRNAMES = {".git"}
-SKIP_FILENAMES: set[str] = set()  # add patterns as needed
-
-# Conservative thread pool. S3 PutObject is fast; the bottleneck is hashing.
 UPLOAD_WORKERS = 16
 
 
 def shallow_clone(git_url: str, git_ref: str, dest: Path) -> None:
-    """Ensure dest contains a checkout of git_url at git_ref.
+    """Ensure dest contains a --no-checkout clone of git_url at git_ref.
 
-    If dest already has a .git dir, fetch + checkout the ref instead of re-cloning.
+    The working tree stays empty so we never run into NTFS reserved-name
+    issues (CON, PRN, AUX, NUL, COMx, LPTx). All source content is later
+    streamed via `git archive`. Idempotent: if dest already has a .git/,
+    we re-fetch the ref instead of re-cloning.
     """
     if (dest / ".git").is_dir():
         log.info("repo exists at %s, fetching %s", dest, git_ref)
         run_cmd(["git", "fetch", "--tags", "--depth=1", "origin", git_ref], cwd=dest)
-        run_cmd(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=dest)
         return
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("cloning %s @ %s into %s", git_url, git_ref, dest)
+    log.info("cloning %s @ %s into %s (no-checkout)", git_url, git_ref, dest)
     run_cmd(
         [
             "git",
@@ -68,53 +72,66 @@ def shallow_clone(git_url: str, git_ref: str, dest: Path) -> None:
             "--branch",
             git_ref,
             "--single-branch",
+            "--no-checkout",
             git_url,
             str(dest),
         ]
     )
 
 
-def commit_iso_timestamp(repo_dir: Path) -> str:
-    """ISO 8601 timestamp of HEAD commit in repo_dir, used as source-mtime."""
+def commit_iso_timestamp(repo_dir: Path, git_ref: str) -> str:
+    """ISO 8601 timestamp of the commit at git_ref, used as source-mtime.
+
+    We resolve git_ref explicitly rather than HEAD because in a fresh
+    --no-checkout clone HEAD may point at the resolved commit but FETCH_HEAD
+    or the tag ref is the safer reference.
+    """
     iso = run_cmd(
-        ["git", "log", "-1", "--format=%cI"],
+        ["git", "log", "-1", "--format=%cI", git_ref],
         cwd=repo_dir,
     )
     if not iso:
-        raise SeedingError(f"could not read HEAD commit timestamp in {repo_dir}")
+        # Fallback: try HEAD
+        iso = run_cmd(["git", "log", "-1", "--format=%cI"], cwd=repo_dir)
+    if not iso:
+        raise SeedingError(f"could not read commit timestamp at {git_ref} in {repo_dir}")
     return iso
 
 
-def iter_files(root: Path) -> Iterable[Path]:
-    """Yield every regular file under root, skipping .git/ and friends.
+def iter_archive_entries(repo_dir: Path, git_ref: str) -> Iterable[tuple[str, bytes]]:
+    """Yield (relative_path, file_bytes) for every regular file at git_ref.
 
-    Symlinks are followed only if they resolve inside root, to avoid escapes.
+    Streams `git archive --format=tar <ref>` and walks the resulting tar via
+    Python's tarfile module. Symlinks, directories, and non-regular entries
+    are skipped. Path separators in tar entries are always forward slashes,
+    which is what we want for S3 keys.
     """
-    root = root.resolve()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRNAMES]
-        for fname in filenames:
-            if fname in SKIP_FILENAMES:
-                continue
-            fp = Path(dirpath) / fname
-            try:
-                resolved = fp.resolve()
-            except OSError:
-                continue
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                continue  # symlink escaping the repo, skip
-            if resolved.is_file():
-                yield fp
-
-
-def md5_hex(path: Path) -> str:
-    h = hashlib.md5(usedforsecurity=False)
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    proc = subprocess.Popen(
+        ["git", "archive", "--format=tar", git_ref],
+        cwd=str(repo_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|*") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                fh = tf.extractfile(member)
+                if fh is None:
+                    continue
+                yield member.name, fh.read()
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.wait()
+        if proc.returncode != 0:
+            err_bytes = proc.stderr.read() if proc.stderr else b""
+            err_text = err_bytes.decode("utf-8", errors="ignore").strip()
+            raise SeedingError(
+                f"git archive {git_ref} failed (exit {proc.returncode}): {err_text}"
+            )
 
 
 def existing_etag(s3, bucket: str, key: str) -> str | None:
@@ -125,34 +142,29 @@ def existing_etag(s3, bucket: str, key: str) -> str | None:
         if code in ("404", "NoSuchKey", "NotFound"):
             return None
         raise
-    etag = resp.get("ETag", "").strip('"')
-    return etag or None
+    return resp.get("ETag", "").strip('"') or None
 
 
-def upload_file(
+def upload_bytes(
     s3,
     bucket: str,
     key: str,
-    local_path: Path,
+    body: bytes,
     source_mtime: str,
 ) -> str:
-    """Upload local_path to s3://bucket/key with source-mtime metadata.
+    """Upload body bytes to s3://bucket/key with source-mtime metadata.
 
-    Returns one of: 'uploaded', 'skipped'. Skipped means an object with a
-    matching ETag (single-part MD5) already exists.
+    Returns 'uploaded' or 'skipped' (matching ETag already present).
     """
-    local_md5 = md5_hex(local_path)
-    remote_etag = existing_etag(s3, bucket, key)
-    if remote_etag == local_md5:
+    local_md5 = hashlib.md5(body, usedforsecurity=False).hexdigest()
+    if existing_etag(s3, bucket, key) == local_md5:
         return "skipped"
-
-    with local_path.open("rb") as body:
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=body,
-            Metadata={"source-mtime": source_mtime},
-        )
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=io.BytesIO(body),
+        Metadata={"source-mtime": source_mtime},
+    )
     return "uploaded"
 
 
@@ -161,43 +173,50 @@ def upload_project(
     bucket: str,
     prefix: str,
     repo_dir: Path,
+    git_ref: str,
     source_mtime: str,
     dry_run: bool,
     limit: int | None,
 ) -> tuple[int, int, int]:
-    """Upload every file under repo_dir to s3://bucket/{prefix}{relpath}.
+    """Stream every file at git_ref from repo_dir and upload to s3://bucket/{prefix}{relpath}.
+
+    We materialize all archive entries up front into a list because tarfile's
+    streaming reader has to be consumed sequentially in a single thread - we
+    can't share a streaming TarFile across our upload workers. Memory cost
+    is bounded by total source size (a few hundred MB at most for these
+    projects), which is fine on any modern machine.
 
     Returns (uploaded, skipped, failed).
     """
-    files = list(iter_files(repo_dir))
-    if limit:
-        files = files[:limit]
-    log.info("project %s: %d files to consider", prefix.rstrip("/"), len(files))
+    log.info("project %s: streaming archive at %s", prefix.rstrip("/"), git_ref)
+    entries: list[tuple[str, bytes]] = []
+    for relpath, body in iter_archive_entries(repo_dir, git_ref):
+        entries.append((relpath, body))
+        if limit and len(entries) >= limit:
+            break
+    log.info("project %s: %d files in archive", prefix.rstrip("/"), len(entries))
 
     if dry_run:
-        sample = files[:5]
         log.info("dry-run, sample keys:")
-        for fp in sample:
-            rel = fp.relative_to(repo_dir).as_posix()
-            log.info("  %s%s", prefix, rel)
+        for relpath, _ in entries[:5]:
+            log.info("  %s%s", prefix, relpath)
         return (0, 0, 0)
 
     uploaded = skipped = failed = 0
 
-    def _task(fp: Path) -> str:
-        rel = fp.relative_to(repo_dir).as_posix()
-        key = f"{prefix}{rel}"
-        return upload_file(s3, bucket, key, fp, source_mtime)
+    def _task(relpath: str, body: bytes) -> str:
+        key = f"{prefix}{relpath}"
+        return upload_bytes(s3, bucket, key, body, source_mtime)
 
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
-        futures = {pool.submit(_task, fp): fp for fp in files}
+        futures = {pool.submit(_task, rel, body): rel for rel, body in entries}
         for i, fut in enumerate(as_completed(futures), start=1):
-            fp = futures[fut]
+            rel = futures[fut]
             try:
                 status = fut.result()
             except Exception as exc:
                 failed += 1
-                log.error("upload failed for %s: %s", fp, exc)
+                log.error("upload failed for %s: %s", rel, exc)
                 continue
             if status == "uploaded":
                 uploaded += 1
@@ -207,7 +226,7 @@ def upload_project(
                 log.info(
                     "  progress: %d/%d (uploaded=%d skipped=%d failed=%d)",
                     i,
-                    len(files),
+                    len(entries),
                     uploaded,
                     skipped,
                     failed,
@@ -263,13 +282,10 @@ def assert_scenario_4(
     paginator = s3.get_paginator("list_objects_v2")
     matches = 0
     sampled = 0
-    # Sampling cap to keep this check tractable; we only need to confirm
-    # that at least min_matches files fall in the range, not exhaustively count.
     sample_cap = max(min_matches * 100, 5000)
     for page in paginator.paginate(Bucket=bucket):
         for obj in page.get("Contents", []) or []:
             if sampled >= sample_cap and matches < min_matches:
-                # widen the window if needed
                 pass
             sampled += 1
             try:
@@ -311,7 +327,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Clone and walk but do not upload to S3.",
+        help="Clone and walk archive but do not upload to S3.",
     )
     parser.add_argument(
         "--only",
@@ -349,7 +365,7 @@ def main() -> int:
     for src in sources:
         repo_dir = workdir("oss", src["name"])
         shallow_clone(src["git_url"], src["git_ref"], repo_dir)
-        source_mtime = commit_iso_timestamp(repo_dir)
+        source_mtime = commit_iso_timestamp(repo_dir, src["git_ref"])
         log.info(
             "project %s pinned at %s, source-mtime=%s",
             src["name"],
@@ -361,6 +377,7 @@ def main() -> int:
             bucket,
             src["prefix"],
             repo_dir,
+            src["git_ref"],
             source_mtime,
             dry_run=args.dry_run,
             limit=args.limit,
@@ -385,7 +402,6 @@ def main() -> int:
         log.warning("--skip-checks set, not validating scenarios")
         return 0
 
-    # Post-conditions, only if we ran a full seed (no --only, no --limit).
     if args.only or args.limit:
         log.info("partial run, skipping scenario assertions")
         return 0
