@@ -16,8 +16,9 @@
 # Usage:
 #   AWS_PROFILE=webapper-sandbox bash scripts/bootstrap_aws.sh
 #
-# Requires: aws CLI, jq, configured credentials with sufficient privilege
-# in account 592920047652.
+# Requires: aws CLI, bash, python3, configured credentials with sufficient
+# privilege in account 592920047652. JSON template rendering is done by
+# scripts/render_template.py to avoid a jq dependency.
 
 set -euo pipefail
 
@@ -33,6 +34,7 @@ INVENTORY_CONFIG_ID="csd-benchmark-daily-inventory"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INFRA_DIR="$REPO_ROOT/infra"
+RENDER="$REPO_ROOT/scripts/render_template.py"
 
 log() { echo "[bootstrap] $*"; }
 err() { echo "[bootstrap][error] $*" >&2; }
@@ -41,8 +43,21 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { err "missing required command: $1"; exit 1; }
 }
 
+# Pick a python3 interpreter once. Prefer python3, fall back to py launcher
+# (Windows) or python.
+pick_python() {
+  for cand in python3 py python; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  err "no python interpreter found on PATH"
+  exit 1
+}
+
 require_cmd aws
-require_cmd jq
+PYTHON="$(pick_python)"
 
 verify_account() {
   local actual
@@ -88,9 +103,9 @@ apply_public_policy() {
   local name="$1"
   local tmpfile
   tmpfile="$(mktemp)"
-  jq --arg b "$name" \
-     '. | del(._comment) | (.Statement[].Resource) |= map(gsub("BUCKET_NAME"; $b))' \
-     "$INFRA_DIR/bucket-policy.json" > "$tmpfile"
+  "$PYTHON" "$RENDER" "$INFRA_DIR/bucket-policy.json" \
+    --strip-comment \
+    --replace "BUCKET_NAME=$name" > "$tmpfile"
   log "applying public-read policy to: $name"
   aws s3api put-bucket-policy --bucket "$name" --policy "file://$tmpfile"
   rm -f "$tmpfile"
@@ -106,7 +121,7 @@ ensure_iam_user() {
 
   local tmpfile
   tmpfile="$(mktemp)"
-  jq 'del(._comment)' "$INFRA_DIR/iam-readonly-user.json" > "$tmpfile"
+  "$PYTHON" "$RENDER" "$INFRA_DIR/iam-readonly-user.json" --strip-comment > "$tmpfile"
 
   local policy_arn="arn:aws:iam::${ACCOUNT_ID_EXPECTED}:policy/${IAM_POLICY}"
   if aws iam get-policy --policy-arn "$policy_arn" >/dev/null 2>&1; then
@@ -173,9 +188,9 @@ create_inventory_bucket() {
 
   local tmpfile
   tmpfile="$(mktemp)"
-  jq --arg b "$BUCKET_INVENTORY" \
-     '. | del(._comment) | (.Statement[].Resource) |= gsub("BUCKET_NAME"; $b)' \
-     "$INFRA_DIR/inventory-dest-bucket-policy.json" > "$tmpfile"
+  "$PYTHON" "$RENDER" "$INFRA_DIR/inventory-dest-bucket-policy.json" \
+    --strip-comment \
+    --replace "BUCKET_NAME=$BUCKET_INVENTORY" > "$tmpfile"
   log "applying inventory destination policy to: $BUCKET_INVENTORY"
   aws s3api put-bucket-policy --bucket "$BUCKET_INVENTORY" --policy "file://$tmpfile"
   rm -f "$tmpfile"
@@ -187,9 +202,9 @@ apply_inventory_config() {
   local source_bucket="$1"
   local tmpfile
   tmpfile="$(mktemp)"
-  jq --arg b "$source_bucket" \
-     '. | del(._comment) | .Destination.S3BucketDestination.Prefix = ("inventory/" + $b + "/")' \
-     "$INFRA_DIR/inventory-config.json" > "$tmpfile"
+  "$PYTHON" "$RENDER" "$INFRA_DIR/inventory-config.json" \
+    --strip-comment \
+    --set-key "Destination.S3BucketDestination.Prefix=inventory/${source_bucket}/" > "$tmpfile"
   log "applying S3 Inventory config on: $source_bucket -> s3://$BUCKET_INVENTORY/inventory/$source_bucket/"
   aws s3api put-bucket-inventory-configuration \
     --bucket "$source_bucket" \

@@ -22,7 +22,7 @@ You need:
 
 - AWS credentials for an account you control with permission to create S3 buckets, IAM users, and CloudWatch alarms. The seeders default to account `592920047652`; change `aws.account_id` in `seed/config.yaml` if you're running against a different account.
 - Python 3.10+
-- `git`, `aws` CLI, `jq`, `bash`
+- `git`, `aws` CLI, `bash`
 
 Steps:
 
