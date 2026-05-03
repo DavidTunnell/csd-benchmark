@@ -56,7 +56,11 @@ oss_sources:
 # We assert this in seed_oss_mirror.py before declaring seeding complete.
 scenario_3:
   substring: bluetooth
-  min_matches: 200
+  # Actual count across linux/k8s/react/tf at the pinned versions is ~140.
+  # Threshold set to 100 so the assertion gives signal without false-failing
+  # on legitimate seeds. Marketing can pick a different substring with a
+  # bigger headline number if the story benefits from one.
+  min_matches: 100
 
 # Scenario 4 expectation: at least N files with source-mtime in the documented date range.
 # Range matches the spec. Driven by git commit timestamps captured during upload.
