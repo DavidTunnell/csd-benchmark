@@ -238,17 +238,18 @@ class CsdRunner(Runner):
         # Reset metrics again right before the timed window.
         operator.reset_click_counter(self.driver)
 
+        # Capture pre-search count so the wait can detect when the search
+        # actually fires (the count value moves off this baseline).
+        baseline_count = self._read_pagination_count()
+        log.info("pre-search pagination count = %s", baseline_count)
+
         # Step 3: timed search.
-        # We type via Chrome DevTools Protocol's Input.insertText, which
-        # injects text at the Chromium level exactly the way a real
-        # keystroke would arrive. Plain element.send_keys, JS-set value,
-        # and ActionChains all produced an input value visible in the
-        # DOM but did not fire CSD's debounced search; CDP insertText
-        # is the deepest reliable mechanism.
+        # We type via Chrome DevTools Protocol so the keystrokes look real
+        # to CSD's MUI search input. The wait then watches for the count
+        # to change off the baseline, which is how we detect the search
+        # has actually fired.
         with stopwatch() as elapsed:
-            # Click the input via ActionChains so MUI's focus listeners run.
             ActionChains(self.driver).move_to_element(search_input).click().perform()
-            # Type each character via CDP - this fires real key/input events.
             for ch in substring:
                 self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
                     "type": "keyDown", "text": ch
@@ -256,7 +257,10 @@ class CsdRunner(Runner):
                 self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
                     "type": "keyUp", "text": ch
                 })
-            count = self._wait_for_search_result_count(timeout=SEARCH_RESULT_TIMEOUT_SEC)
+            count = self._wait_for_search_result_count(
+                timeout=SEARCH_RESULT_TIMEOUT_SEC,
+                baseline=baseline_count,
+            )
             time_to_result = elapsed()
 
 
@@ -268,11 +272,11 @@ class CsdRunner(Runner):
 
         # CSD and the CLI define "match" differently. The CLI grep treats
         # any 'test' substring in the full S3 key as a match (32,763 hits).
-        # CSD matches against the filename portion only, which yields ~11,457
+        # CSD matches against the filename portion only, which yields 11,457
         # in our seeded bucket. Both are correct interpretations; the
         # benchmark reports both numbers with notes documenting the per-tool
         # rubric so the comparison stays apples-to-apples.
-        result_correct = count is not None and count >= 5000
+        result_correct = count is not None and count >= 10000
 
         notes = (
             f"CSD search '{substring}' on drive '{drive_name}', count={count} "
@@ -394,54 +398,86 @@ class CsdRunner(Runner):
             f"could not click drive {drive_name!r} via any strategy: {last_err}"
         )
 
-    def _wait_for_search_result_count(self, timeout: float) -> "int | None":
-        """Poll the MUI TablePagination 'X-Y of N' text until stable, return N.
-
-        Material-UI renders pagination as a region containing 'Rows per page',
-        a select, and the displayed-rows label like '1-10 of 11457'. We scope
-        the regex to that specific region instead of the whole document body
-        so unrelated 'of N' text elsewhere on the page (drive counters,
-        tooltips, etc.) does not poison the read. If the pagination region
-        is not present yet we keep polling until it appears.
-        """
-        # Anchor xpath: the MuiTablePagination root, or the element containing
-        # "Rows per page" if MUI class names change.
+    def _read_pagination_count(self) -> "int | None":
+        """Read the current 'of N' value from the MUI pagination region."""
         candidate_xpaths = [
             "//*[contains(@class, 'MuiTablePagination')]",
             "//*[contains(text(), 'Rows per page')]/ancestor::*[1]",
             "//*[contains(text(), 'Rows per page')]/parent::*",
         ]
-        pattern = re.compile(r"\b(\d[\d,]*)\s*[–—-]\s*(\d[\d,]*)\s+of\s+([\d,]+)\b")
-        # Fallback for the case where the visible label is just "0-0 of 0".
-        bare_pattern = re.compile(r"\bof\s+([\d,]+)\b")
+        for xp in candidate_xpaths:
+            try:
+                elem = self.driver.find_element(By.XPATH, xp)
+                text = elem.text
+                if not text:
+                    continue
+                m = re.search(
+                    r"\b(\d[\d,]*)\s*[–—-]\s*(\d[\d,]*)\s+of\s+([\d,]+)\b",
+                    text,
+                )
+                if m:
+                    return int(m.group(3).replace(",", ""))
+                m2 = re.search(r"\bof\s+([\d,]+)\b", text)
+                if m2:
+                    return int(m2.group(1).replace(",", ""))
+            except Exception:
+                continue
+        return None
 
-        last_seen: int | None = None
-        last_change = time.perf_counter()
-        end = last_change + timeout
-        # CSD's basic search debounces ~500ms; 2s of stability is safe.
+    def _wait_for_search_result_count(
+        self,
+        timeout: float,
+        baseline: "int | None" = None,
+    ) -> "int | None":
+        """Wait for the search to fire (count moves off baseline), then settle.
+
+        Two phases:
+          1. Wait for the count to differ from baseline. This is how we know
+             the search request actually started and the result has landed.
+             We do not consider the baseline "stable" because a stable
+             pre-search count just means the search has not fired yet.
+          2. Once the count has moved, poll until it stops changing for
+             settle_sec consecutive seconds, then return the stable value.
+
+        If baseline is None, we skip phase 1 (used when there is no
+        meaningful pre-search state).
+        """
+        end = time.perf_counter() + timeout
+        # CSD's basic search may take a few seconds to fire on a large bucket.
+        change_grace_sec = 30
         settle_sec = 2.0
 
+        # Phase 1: wait for change off baseline (if a baseline was supplied).
+        if baseline is not None:
+            change_deadline = time.perf_counter() + min(change_grace_sec, timeout)
+            log.info(
+                "wait_for_count phase 1: waiting for count to change from baseline=%d",
+                baseline,
+            )
+            while time.perf_counter() < change_deadline:
+                current = self._read_pagination_count()
+                if current is not None and current != baseline:
+                    log.info(
+                        "wait_for_count: count changed to %d after %.2fs",
+                        current,
+                        change_grace_sec - (change_deadline - time.perf_counter()),
+                    )
+                    break
+                time.sleep(0.1)
+            else:
+                # Loop exited without break - count never changed.
+                final = self._read_pagination_count()
+                log.warning(
+                    "wait_for_count: count never changed from baseline %d in %.0fs (read=%s)",
+                    baseline, change_grace_sec, final,
+                )
+                return final
+
+        # Phase 2: wait for stability.
+        last_seen = self._read_pagination_count()
+        last_change = time.perf_counter()
         while time.perf_counter() < end:
-            region_text = ""
-            for xp in candidate_xpaths:
-                try:
-                    elem = self.driver.find_element(By.XPATH, xp)
-                    region_text = elem.text
-                    if region_text:
-                        break
-                except Exception:
-                    continue
-
-            current: int | None = None
-            if region_text:
-                m = pattern.search(region_text)
-                if m:
-                    current = int(m.group(3).replace(",", ""))
-                else:
-                    m2 = bare_pattern.search(region_text)
-                    if m2:
-                        current = int(m2.group(1).replace(",", ""))
-
+            current = self._read_pagination_count()
             if current != last_seen:
                 last_seen = current
                 last_change = time.perf_counter()

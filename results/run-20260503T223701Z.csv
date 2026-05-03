@@ -1,0 +1,2 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260503T223701Z,,csd,3,substring-across-bucket,cold,non-technical,5.886756099993363,1,4,,,true,true,true,11457,"CSD search 'test' on drive 'csd-benchmark-oss-mirror', count=11457 (CSD matches by filename; CLI grep on s3 ls matches by full key)"
