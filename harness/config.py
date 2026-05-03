@@ -39,6 +39,16 @@ CSD_DRIVE_NAMES: dict[str, str] = {
     BUCKET_OSS_MIRROR: "csd-benchmark-oss-mirror",
 }
 
+# When set, the CSD runner attaches Selenium to an already-running Chrome
+# at this debugger address instead of launching a new browser. The operator
+# starts Chrome with --remote-debugging-port=9222 and a custom user-data-dir,
+# signs in once, and leaves the window open. The harness then drives that
+# session - same Chrome environment as a real user, no Selenium-managed
+# Chrome quirks that block CSD's debounced search from firing.
+CSD_CHROME_DEBUGGER_ADDRESS = os.environ.get(
+    "CSD_BENCHMARK_CHROME_DEBUGGER_ADDRESS", "localhost:9222"
+)
+
 # 5-minute soft cap on time-to-result, per spec.
 TIMEOUT_SOFT_CAP_SEC = 300
 
