@@ -21,7 +21,11 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 BUCKET_FLAT = "csd-benchmark-flat-150k"
 BUCKET_OSS_MIRROR = "csd-benchmark-oss-mirror"
 
-CSD_BASE_URL = "https://drive.cloudsee.cloud"
+# UAT environment for the v1 benchmark - matches where the demo account
+# has the buckets connected and indexed. Final marketing run can move
+# to drive.cloudsee.cloud if Scott wants production numbers; the harness
+# is environment-agnostic.
+CSD_BASE_URL = "https://drive-uat.cloudsee.cloud"
 AWS_CONSOLE_BASE_URL = "https://console.aws.amazon.com/s3/"
 
 # CSD identifies S3 buckets by a "Drive" display name in the left sidebar.
