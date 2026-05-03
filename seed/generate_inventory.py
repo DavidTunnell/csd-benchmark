@@ -20,13 +20,20 @@ import argparse
 import csv
 import io
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
+import botocore.config
 import botocore.exceptions
 
 from common import Config, SeedingError, get_logger
 
 log = get_logger("generate_inventory")
+
+# HEAD object is cheap; lots of parallelism pays off. Sequential at ~10/sec
+# would take 4+ hours for the oss-mirror bucket. With 64 workers we hit S3's
+# per-prefix rate limit comfortably and finish in under 5 minutes per bucket.
+HEAD_WORKERS = 64
 
 
 def head_with_retry(s3, bucket: str, key: str, attempts: int = 3) -> dict | None:
@@ -47,12 +54,15 @@ def head_with_retry(s3, bucket: str, key: str, attempts: int = 3) -> dict | None
 
 
 def build_inventory(s3, bucket: str, skip_prefix: str) -> str:
-    """Walk the bucket and return CSV text: key, size_bytes, etag, source_mtime."""
+    """Walk the bucket and return CSV text: key, size_bytes, etag, source_mtime.
+
+    HEAD requests run in parallel. Output rows are emitted in the order list_objects_v2
+    returns them, regardless of the order HEAD futures complete in, so the sidecar is
+    deterministic across runs (S3 list order is lexical and stable).
+    """
+    log.info("phase 1: listing all objects to build work plan")
     paginator = s3.get_paginator("list_objects_v2")
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["key", "size_bytes", "etag", "source_mtime"])
-    counted = 0
+    listing: list[dict] = []
     skipped = 0
     for page in paginator.paginate(Bucket=bucket):
         for obj in page.get("Contents", []) or []:
@@ -60,22 +70,46 @@ def build_inventory(s3, bucket: str, skip_prefix: str) -> str:
             if skip_prefix and key.startswith(skip_prefix):
                 skipped += 1
                 continue
-            head = head_with_retry(s3, bucket, key)
-            mtime = ""
-            if head is not None:
-                mtime = head.get("Metadata", {}).get("source-mtime", "")
-            writer.writerow(
-                [
-                    key,
-                    obj.get("Size", 0),
-                    obj.get("ETag", "").strip('"'),
-                    mtime,
-                ]
-            )
-            counted += 1
-            if counted % 5000 == 0:
-                log.info("  inventory progress: %d rows", counted)
-    log.info("inventory complete: %d rows (skipped %d under %s)", counted, skipped, skip_prefix)
+            listing.append(obj)
+    log.info("phase 1 done: %d objects to inventory (skipped %d under %s)",
+             len(listing), skipped, skip_prefix)
+
+    log.info("phase 2: fetching source-mtime via parallel HEAD (workers=%d)", HEAD_WORKERS)
+    keys_in_order = [obj["Key"] for obj in listing]
+    mtime_by_key: dict[str, str] = {}
+
+    def _fetch_mtime(key: str) -> tuple[str, str]:
+        head = head_with_retry(s3, bucket, key)
+        if head is None:
+            return key, ""
+        return key, head.get("Metadata", {}).get("source-mtime", "")
+
+    with ThreadPoolExecutor(max_workers=HEAD_WORKERS) as pool:
+        futures = {pool.submit(_fetch_mtime, k): k for k in keys_in_order}
+        done = 0
+        for fut in as_completed(futures):
+            key, mtime = fut.result()
+            mtime_by_key[key] = mtime
+            done += 1
+            if done % 10000 == 0:
+                log.info("  HEAD progress: %d/%d", done, len(keys_in_order))
+
+    log.info("phase 3: writing CSV")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["key", "size_bytes", "etag", "source_mtime"])
+    for obj in listing:
+        key = obj["Key"]
+        writer.writerow(
+            [
+                key,
+                obj.get("Size", 0),
+                obj.get("ETag", "").strip('"'),
+                mtime_by_key.get(key, ""),
+            ]
+        )
+
+    log.info("inventory complete: %d rows", len(listing))
     return buf.getvalue()
 
 
@@ -93,7 +127,14 @@ def main() -> int:
     fname = inv["flat_filename"] if args.bucket == "flat" else inv["oss_filename"]
     target_key = f"{prefix}{fname}"
 
-    s3 = boto3.client("s3", region_name=cfg.region)
+    # Bump the connection pool so HEAD_WORKERS doesn't choke. boto3's default
+    # pool size is 10, which leads to "Connection pool is full" warnings under
+    # parallel load.
+    s3 = boto3.client(
+        "s3",
+        region_name=cfg.region,
+        config=botocore.config.Config(max_pool_connections=HEAD_WORKERS + 8),
+    )
     log.info("building inventory for s3://%s, output=%s", bucket, target_key)
     csv_body = build_inventory(s3, bucket, skip_prefix=prefix)
 
