@@ -3,7 +3,8 @@
 Implements the locked architectural decisions:
   - Auth: capture once, replay per cold-cache reset (auth_state.py)
   - Selectors: find_by_intent with data-testid > aria-label > CSS fallback
-  - HTTP capture: selenium-wire wraps Chrome and exposes driver.requests
+  - HTTP capture: TODO via Chrome DevTools Protocol; v1 uses plain Selenium
+    because selenium-wire's bundled mitmproxy is broken on Python 3.14
   - Scenario 3 (substring across whole bucket) is implemented; the others
     follow the same pattern and can be added incrementally.
 
@@ -28,11 +29,11 @@ from __future__ import annotations
 import re
 import time
 
+from selenium import webdriver as sw_webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from seleniumwire import webdriver as sw_webdriver
 
 from .. import auth_state, operator
 from ..common import get_logger, stopwatch
@@ -156,10 +157,6 @@ class CsdRunner(Runner):
 
         # Clear per-run metrics
         operator.reset_click_counter(self.driver)
-        try:
-            del self.driver.requests
-        except Exception:
-            pass
 
         if scenario.id == 3:
             return self._run_scenario_3_substring(scenario, run_id, cache_state)
@@ -226,10 +223,6 @@ class CsdRunner(Runner):
 
         # Reset metrics again right before the timed window.
         operator.reset_click_counter(self.driver)
-        try:
-            del self.driver.requests
-        except Exception:
-            pass
 
         # Step 3: timed search.
         with stopwatch() as elapsed:
@@ -239,8 +232,10 @@ class CsdRunner(Runner):
             time_to_result = elapsed()
 
         click_count = operator.read_click_counter(self.driver)
-        http_count = len(self.driver.requests)
-        net_bytes = self._sum_response_bytes(self.driver.requests)
+        # HTTP request count + bytes deliberately not captured in v1 (see
+        # module docstring re: selenium-wire incompatibility on Py 3.14).
+        http_count = None
+        net_bytes = None
 
         # Per locked rubric: ground truth at the seeded oss-mirror is 32,763.
         # If the drive is not pointed at our bucket yet, the count will be
@@ -354,17 +349,6 @@ class CsdRunner(Runner):
             time.sleep(0.1)
 
         return last_seen
-
-    @staticmethod
-    def _sum_response_bytes(requests) -> int:
-        total = 0
-        for r in requests:
-            try:
-                if r.response and r.response.body:
-                    total += len(r.response.body)
-            except Exception:
-                continue
-        return total
 
     def _fail_result(
         self,

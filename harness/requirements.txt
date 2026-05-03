@@ -1,9 +1,12 @@
 # Selenium for CSD and AWS Console runners.
 selenium>=4.20.0
 
-# selenium-wire captures network traffic for the HTTP request count and
-# bytes-transferred metrics. It also writes HAR files for the run archive.
-selenium-wire>=5.1.0
+# selenium-wire would give us HTTP request count + bytes for free, but its
+# bundled mitmproxy is not compatible with Python 3.14 (broken on
+# blinker._saferef and pkg_resources). v1 of the harness drops it; we pick
+# up HTTP metrics via Chrome DevTools Protocol once a v2 of network capture
+# is wired. Tracking this in csd_runner.py TODOs.
+# selenium-wire>=5.1.0
 
 # webdriver-manager auto-fetches chromedriver matching the local Chrome.
 webdriver-manager>=4.0.1
