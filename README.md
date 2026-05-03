@@ -2,7 +2,13 @@
 
 Reproducible benchmark comparing **CloudSee Drive** with **Fast Buckets** and **Tag Explorer** against the **AWS Console** and the **AWS CLI** on real-scale S3 buckets. Five scenarios, three tools, public seed scripts, public buckets, public results.
 
-This repo holds the seeders that build the benchmark buckets, the infra config, and (in `results/`) the official run output once Phases 6 and 7 of the rollout plan complete. The harnesses live in a sibling repo.
+This repo holds the seeders that build the benchmark buckets, the harness in `harness/`, and the run output in `results/`.
+
+**Mirrored at two remotes:**
+- [bitbucket.org/cloudsee-drive/csd-benchmark](https://bitbucket.org/cloudsee-drive/csd-benchmark) (primary, internal Webapper)
+- [github.com/DavidTunnell/csd-benchmark](https://github.com/DavidTunnell/csd-benchmark) (public mirror)
+
+Both stay in sync via a single `git push origin main`. Cloning either remote works.
 
 ## What gets built
 
