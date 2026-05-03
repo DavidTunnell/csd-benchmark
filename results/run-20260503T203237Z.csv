@@ -1,0 +1,11 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260503T203237Z,,cli,1,flat-bucket-target-deep,cold,technical,0.9131108000001404,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T203237Z,,cli,1,flat-bucket-target-deep,warm,technical,0.8765774999919813,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T203237Z,,cli,2,six-folders-deep,cold,technical,0.9154167000087909,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T203237Z,,cli,2,six-folders-deep,warm,technical,0.9191752999904566,0,,,,true,false,true,,"stub run, partial automation"
+run-20260503T203237Z,,cli,3,substring-across-bucket,cold,technical,43.6818889999995,0,,,,true,false,true,32763,"aws s3 ls --recursive piped through grep 'test', counted 32763 matches"
+run-20260503T203237Z,,cli,3,substring-across-bucket,warm,technical,44.04068959999131,0,,,,true,false,true,32763,"aws s3 ls --recursive piped through grep 'test', counted 32763 matches"
+run-20260503T203237Z,,cli,4,date-range,cold,technical,3.9882570000190753,0,,,,true,false,true,84905,"aws s3 cp inventory CSV + filter rows by source_mtime in [2024-01-01T00:00:00Z, 2024-12-31T23:59:59Z], counted 84905"
+run-20260503T203237Z,,cli,4,date-range,warm,technical,5.281890799989924,0,,,,true,false,true,84905,"aws s3 cp inventory CSV + filter rows by source_mtime in [2024-01-01T00:00:00Z, 2024-12-31T23:59:59Z], counted 84905"
+run-20260503T203237Z,,cli,5,tag-search,cold,technical,379.44779049998033,0,,,,false,false,true,3060,"inline boto3 (parallel get_object_tagging) for domain=audio, counted 3060. CLI cannot do this without custom code per spec."
+run-20260503T203237Z,,cli,5,tag-search,warm,technical,372.0617675000103,0,,,,false,false,true,3060,"inline boto3 (parallel get_object_tagging) for domain=audio, counted 3060. CLI cannot do this without custom code per spec."

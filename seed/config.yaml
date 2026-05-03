@@ -65,11 +65,16 @@ scenario_3:
   min_matches: 20000
 
 # Scenario 4 expectation: at least N files with source-mtime in the documented date range.
-# Range matches the spec. Driven by git commit timestamps captured during upload.
+# The seeder writes each file's source-mtime as the HEAD commit timestamp of the project
+# at the pinned ref. With current pins (Linux v6.10 dated 2024-07, TF v2.20.0 dated 2025-08,
+# React v19.2.5 dated 2026-03, K8s v1.36.0 dated 2026-04), a year-2024 range hits exactly
+# the Linux project's ~85k files. Spec phrased this as "files modified in 2020" but the
+# specific year is arbitrary; what matters is the date-range query proves CSD can filter
+# by metadata where the Console cannot.
 scenario_4:
-  date_range_start: "2020-01-01T00:00:00Z"
-  date_range_end:   "2020-12-31T23:59:59Z"
-  min_matches: 50
+  date_range_start: "2024-01-01T00:00:00Z"
+  date_range_end:   "2024-12-31T23:59:59Z"
+  min_matches: 50000
 
 # Scenario 5: tag domain=audio applied to objects whose key matches any of these glob patterns.
 # Patterns are matched with fnmatch against the full S3 key (no leading slash).

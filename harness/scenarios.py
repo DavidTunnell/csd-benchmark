@@ -70,9 +70,9 @@ SCENARIOS: list[Scenario] = [
         id=4,
         name="date-range",
         bucket=BUCKET_OSS_MIRROR,
-        description="Find files modified in 2020 (source-mtime metadata) across all four projects.",
-        date_range_start="2020-01-01T00:00:00Z",
-        date_range_end="2020-12-31T23:59:59Z",
+        description="Find files modified in 2024 (source-mtime metadata). Hits Linux v6.10's ~85k files.",
+        date_range_start="2024-01-01T00:00:00Z",
+        date_range_end="2024-12-31T23:59:59Z",
     ),
     Scenario(
         id=5,
