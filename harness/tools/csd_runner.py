@@ -81,7 +81,9 @@ class CsdRunner(Runner):
             try:
                 auth_state.restore_to_driver(self.driver, saved, CSD_BASE_URL)
                 self.driver.get(CSD_BASE_URL)
-                if self._is_logged_in():
+                # Dashboard JS needs a moment to render after navigation;
+                # poll the sentinel before falling back to manual sign-in.
+                if self._is_logged_in(timeout=15):
                     log.info("auth restored from saved state")
                     operator.inject_click_counter(self.driver)
                     return
@@ -144,7 +146,7 @@ class CsdRunner(Runner):
             raise RuntimeError("no saved CSD auth state; setup() must succeed first")
         auth_state.restore_to_driver(self.driver, saved, CSD_BASE_URL)
         self.driver.get(CSD_BASE_URL)
-        if not self._is_logged_in():
+        if not self._is_logged_in(timeout=15):
             raise RuntimeError("auth replay failed; saved state may be stale")
 
         operator.inject_click_counter(self.driver)
@@ -211,6 +213,10 @@ class CsdRunner(Runner):
 
         # Step 1: navigate to the drive root.
         self._click_drive(drive_name)
+        # MUI dialogs and drawers leave invisible backdrops in the DOM during
+        # transitions; they intercept clicks even at opacity 0. Wait for the
+        # backdrop to be gone before interacting with the search input.
+        self._wait_for_backdrop_clear(timeout=15)
         # Wait until the search input is interactable - that's our signal that
         # the drive view has rendered.
         search_input = self._wait_for_intent("search-input", timeout=20)
@@ -226,7 +232,9 @@ class CsdRunner(Runner):
 
         # Step 3: timed search.
         with stopwatch() as elapsed:
-            search_input.click()
+            # JS-click bypasses MUI's pointer-events-blocking backdrops
+            # that occasionally linger after drive transitions.
+            self.driver.execute_script("arguments[0].focus();", search_input)
             search_input.send_keys(substring)
             count = self._wait_for_search_result_count(timeout=SEARCH_RESULT_TIMEOUT_SEC)
             time_to_result = elapsed()
@@ -271,12 +279,44 @@ class CsdRunner(Runner):
 
     # ----- Helpers -----
 
-    def _is_logged_in(self) -> bool:
-        try:
-            self.driver.find_element(By.XPATH, LOGGED_IN_SENTINEL_XPATH)
-            return True
-        except Exception:
-            return False
+    def _is_logged_in(self, timeout: float = 0.0) -> bool:
+        """Check whether the post-login sentinel is in the DOM.
+
+        timeout > 0 polls until either the sentinel appears or the timeout
+        is hit. We use a short poll after auth restore because the dashboard
+        JS takes a moment to render after navigation.
+        """
+        end = time.perf_counter() + max(timeout, 0.0)
+        while True:
+            try:
+                self.driver.find_element(By.XPATH, LOGGED_IN_SENTINEL_XPATH)
+                return True
+            except Exception:
+                if time.perf_counter() >= end:
+                    return False
+                time.sleep(0.25)
+
+    def _wait_for_backdrop_clear(self, timeout: float) -> None:
+        """Wait until any MUI backdrop element is no longer in the DOM.
+
+        Material-UI dialogs and drawers leave invisible <div class='MuiBackdrop-root'>
+        elements during transitions; they intercept pointer events even when
+        opacity is 0. We poll until none remain. If the timeout passes with
+        a backdrop still around, we proceed anyway and rely on JS-based
+        interactions in the caller.
+        """
+        end = time.perf_counter() + timeout
+        while time.perf_counter() < end:
+            backdrops = self.driver.find_elements(
+                By.CSS_SELECTOR, ".MuiBackdrop-root"
+            )
+            if not backdrops:
+                return
+            # All-zero-opacity backdrops are usually safe to ignore; but they
+            # still intercept clicks per the error we saw, so we keep waiting
+            # until they unmount entirely.
+            time.sleep(0.2)
+        log.warning("MUI backdrop still present after %.1fs; proceeding", timeout)
 
     def _wait_for_intent(self, intent: str, timeout: float):
         """Wait for an intent-resolved element to be present, return it."""
@@ -291,26 +331,44 @@ class CsdRunner(Runner):
     def _click_drive(self, drive_name: str) -> None:
         """Click the drive entry in the left sidebar.
 
-        Tries data-testid first, then falls back to matching button text.
+        CSD renders drives as buttons that contain a disk icon plus the
+        drive name text. We try several strategies: data-testid first,
+        then aria-label match, then visible-text contains() across button
+        / link / role=button. We log which strategy hits so the team can
+        prioritise data-testid coverage on the high-traffic selectors.
         """
-        css_testid = f"[data-testid='drive-{drive_name}']"
-        try:
-            elem = self.driver.find_element(By.CSS_SELECTOR, css_testid)
-            elem.click()
-            return
-        except Exception:
-            pass
+        candidates = [
+            ("data-testid", f"//*[@data-testid='drive-{drive_name}']"),
+            ("aria-label", f"//*[@aria-label='{drive_name}']"),
+            (
+                "button-contains",
+                f"//button[contains(normalize-space(.), '{drive_name}')]",
+            ),
+            (
+                "link-contains",
+                f"//a[contains(normalize-space(.), '{drive_name}')]",
+            ),
+            (
+                "role-button-contains",
+                f"//*[@role='button' and contains(normalize-space(.), '{drive_name}')]",
+            ),
+        ]
 
-        # Fall back to matching button or link text. CSD renders drives as
-        # buttons in a sidebar list.
-        xpath = (
-            f"//button[normalize-space()='{drive_name}'] | "
-            f"//a[normalize-space()='{drive_name}']"
+        last_err: Exception | None = None
+        for label, xpath in candidates:
+            try:
+                elem = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
+                log.info("clicked drive %r via %s strategy", drive_name, label)
+                elem.click()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+
+        raise TimeoutException(
+            f"could not click drive {drive_name!r} via any strategy: {last_err}"
         )
-        elem = WebDriverWait(self.driver, 15).until(
-            EC.element_to_be_clickable((By.XPATH, xpath))
-        )
-        elem.click()
 
     def _wait_for_search_result_count(self, timeout: float) -> "int | None":
         """Poll until CSD's pagination text shows a stable count, return it.

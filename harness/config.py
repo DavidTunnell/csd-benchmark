@@ -77,7 +77,11 @@ class CsdCreds:
 
     @classmethod
     def from_env(cls) -> "CsdCreds":
+        # Email is non-secret (shown in operator prompts as a hint).
+        # Password is typed manually by the operator in the live browser
+        # window per the locked auth decision; the harness never types it.
+        # Empty defaults so the runner can launch without CI env wiring.
         return cls(
-            email=os.environ["CSD_BENCHMARK_CSD_EMAIL"],
-            password=os.environ["CSD_BENCHMARK_CSD_PASSWORD"],
+            email=os.environ.get("CSD_BENCHMARK_CSD_EMAIL", "demoadmin@cloudsee.cloud"),
+            password=os.environ.get("CSD_BENCHMARK_CSD_PASSWORD", ""),
         )

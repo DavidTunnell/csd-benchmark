@@ -1,0 +1,1 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
