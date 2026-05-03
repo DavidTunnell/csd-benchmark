@@ -24,6 +24,17 @@ BUCKET_OSS_MIRROR = "csd-benchmark-oss-mirror"
 CSD_BASE_URL = "https://drive.cloudsee.cloud"
 AWS_CONSOLE_BASE_URL = "https://console.aws.amazon.com/s3/"
 
+# CSD identifies S3 buckets by a "Drive" display name in the left sidebar.
+# The drive name is whatever the operator picks when connecting the bucket
+# inside CSD - it does not have to equal the S3 bucket name. This map lets
+# the harness translate "Scenario X bucket name" -> "drive name to click in
+# the sidebar". Update these strings to match what's actually visible in
+# the demo account's drive list.
+CSD_DRIVE_NAMES: dict[str, str] = {
+    BUCKET_FLAT: "csd-benchmark-flat-150k",
+    BUCKET_OSS_MIRROR: "csd-benchmark-oss-mirror",
+}
+
 # 5-minute soft cap on time-to-result, per spec.
 TIMEOUT_SOFT_CAP_SEC = 300
 

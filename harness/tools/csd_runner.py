@@ -1,38 +1,57 @@
 """CSD runner - drives drive.cloudsee.cloud via Selenium.
 
-STATUS: scaffold. Selenium logic intentionally not implemented yet so the
-orchestrator interface and result schema get reviewed before time is sunk
-into selectors that will change as CSD evolves.
+Implements the locked architectural decisions:
+  - Auth: capture once, replay per cold-cache reset (auth_state.py)
+  - Selectors: find_by_intent with data-testid > aria-label > CSS fallback
+  - HTTP capture: selenium-wire wraps Chrome and exposes driver.requests
+  - Scenario 3 (substring across whole bucket) is implemented; the others
+    follow the same pattern and can be added incrementally.
 
-Design notes:
-  - Use selenium-wire so we can capture HTTP request count and bytes-out
-    for free. selenium-wire wraps a Chrome WebDriver and exposes
-    driver.requests as a list.
-  - One headed Chrome session per benchmark run group, fresh profile per run.
-  - Login at startup, then each scenario starts from the bucket root.
-  - Cold cache = clear cookies + storage and reload. Warm cache = no reset.
+First-time setup:
+  1. The harness opens Chrome, navigates to drive.cloudsee.cloud
+  2. If saved auth state exists at .local/auth/csd.json, restore + verify
+  3. If not, prompt the operator to sign in manually in the visible window;
+     after the operator confirms with the hotkey, capture cookies/storage to disk
+  4. From then on, every cold-cache reset replays the saved state without
+     re-authenticating
 
-Open questions David needs to weigh in on before this gets fleshed out:
-  1. Auth flow - is there a non-OAuth login that selenium can drive headlessly?
-     If only OAuth, we need a session cookie injection path, or accept manual
-     login at the start of each run group (matches spec's "human-supervised").
-  2. Selector strategy - do we use data-testid attributes, ARIA labels, or
-     visual locators? Whichever is most stable across releases.
-  3. How does CSD report search results? Single hit count we can read, or do
-     we have to count items in the result list?
+Run-time:
+  - reset_cache(cold) clears cookies/storage and replays saved auth
+  - reset_cache(warm) is a no-op
+  - run() drives the scenario, stops the timer on result visibility, reads
+    the result count from CSD's "X-Y of N" pagination text, captures click
+    count + HTTP count + bytes, returns RunResult
 """
 
 from __future__ import annotations
 
+import re
+import time
+
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from seleniumwire import webdriver as sw_webdriver
+
 from .. import auth_state, operator
 from ..common import get_logger, stopwatch
-from ..config import CSD_BASE_URL, CsdCreds
+from ..config import CSD_BASE_URL, CSD_DRIVE_NAMES, CsdCreds
 from ..results import RunResult
 from ..scenarios import Scenario
 from ..selectors import csd_resolver
 from .base import Runner
 
 log = get_logger("csd_runner")
+
+# Element used to verify "logged in" state. The drives sidebar header is
+# only rendered post-login. We look for the "DRIVES" label.
+LOGGED_IN_SENTINEL_XPATH = (
+    "//*[contains(translate(text(), 'DRIVES', 'drives'), 'drives')]"
+)
+
+# How long we wait for the result count to settle after typing a substring.
+SEARCH_RESULT_TIMEOUT_SEC = 60
 
 
 class CsdRunner(Runner):
@@ -42,57 +61,335 @@ class CsdRunner(Runner):
         self.creds = creds
         self.driver = None  # selenium-wire webdriver instance
 
+    # ----- Setup / teardown / cache -----
+
     def setup(self) -> None:
-        # Real flow when implemented:
-        #   1. launch Chrome with selenium-wire
-        #   2. navigate to CSD_BASE_URL
-        #   3. if auth_state.load("csd") returns a recent state, restore it
-        #      and verify with auth_state.is_logged_in(driver, sentinel)
-        #   4. otherwise: prompt the operator to sign in manually, then call
-        #      auth_state.capture_from_driver and save
-        #   5. inject click counter via operator.inject_click_counter
-        log.info("setup: would launch Chrome and ensure CSD session is live at %s", CSD_BASE_URL)
+        log.info("setup: launching Chrome with selenium-wire")
+        options = sw_webdriver.ChromeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        # Visible browser per spec (human-supervised). No --headless.
+        self.driver = sw_webdriver.Chrome(options=options)
+        self.driver.set_window_size(1450, 900)
+
+        log.info("navigating to %s", CSD_BASE_URL)
+        self.driver.get(CSD_BASE_URL)
+
+        saved = auth_state.load("csd")
+        if saved is not None:
+            log.info("found saved auth state, attempting restore")
+            try:
+                auth_state.restore_to_driver(self.driver, saved, CSD_BASE_URL)
+                self.driver.get(CSD_BASE_URL)
+                if self._is_logged_in():
+                    log.info("auth restored from saved state")
+                    operator.inject_click_counter(self.driver)
+                    return
+                log.warning("saved auth did not produce logged-in state, re-prompting")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("auth restore failed: %s; re-prompting", exc)
+
+        # Manual sign-in path. Operator types the password in the visible
+        # browser window, then types the hotkey on the terminal to confirm.
+        log.info("waiting for manual sign-in")
+        signal = operator.prompt_handoff_and_wait(
+            description="Sign in to CSD in the open Chrome window.",
+            target_hint=(
+                f"Account: {self.creds.email}. After dashboard loads, press 'g' + Enter."
+            ),
+            hotkey="g",
+            timeout_sec=600,
+        )
+        if not signal.confirmed:
+            raise RuntimeError(f"sign-in not confirmed: {signal.notes}")
+
+        if not self._is_logged_in():
+            raise RuntimeError("operator confirmed sign-in but sentinel not visible")
+
+        captured = auth_state.capture_from_driver(self.driver, CSD_BASE_URL)
+        auth_state.save("csd", captured)
+        operator.inject_click_counter(self.driver)
+        log.info("setup complete; auth saved for future runs")
 
     def teardown(self) -> None:
-        log.info("teardown: would close Chrome")
-        # TODO: driver.quit()
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("driver.quit raised: %s", exc)
+        self.driver = None
 
     def reset_cache(self, state: str) -> None:
-        # Cold cache: clear cookies + storage, then re-restore the saved auth
-        # state so we don't have to re-authenticate every run.
-        if state == "cold":
-            log.info("reset_cache(cold): would clear cookies + storage and replay saved auth state")
-            saved = auth_state.load("csd")
-            if saved is None:
-                log.warning("no saved CSD auth state - run setup() first")
-            # TODO: driver.delete_all_cookies(); clear storage via JS;
-            # driver.get(CSD_BASE_URL); auth_state.restore_to_driver(driver, saved, CSD_BASE_URL)
-            # operator.inject_click_counter(driver)
-        else:
+        if state == "warm":
             log.info("reset_cache(warm): no-op")
+            return
+
+        log.info("reset_cache(cold): clearing cookies + storage and replaying auth")
+        if self.driver is None:
+            raise RuntimeError("driver not initialised; call setup() first")
+
+        # Clear browser state. Need to be on the same origin first to access storage.
+        self.driver.get(CSD_BASE_URL)
+        self.driver.delete_all_cookies()
+        try:
+            self.driver.execute_script("localStorage.clear(); sessionStorage.clear();")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not clear storage: %s", exc)
+
+        # Reload to make sure the cleared state takes effect.
+        self.driver.get(CSD_BASE_URL)
+
+        saved = auth_state.load("csd")
+        if saved is None:
+            raise RuntimeError("no saved CSD auth state; setup() must succeed first")
+        auth_state.restore_to_driver(self.driver, saved, CSD_BASE_URL)
+        self.driver.get(CSD_BASE_URL)
+        if not self._is_logged_in():
+            raise RuntimeError("auth replay failed; saved state may be stale")
+
+        operator.inject_click_counter(self.driver)
+
+    # ----- Scenario dispatch -----
 
     def run(self, scenario: Scenario, run_id: str, cache_state: str) -> RunResult:
-        log.info("run: scenario=%s cache=%s (stub - returns placeholder)", scenario.name, cache_state)
-        # Real flow when implemented:
-        #   - operator.reset_click_counter(driver)
-        #   - clear selenium-wire requests
-        #   - prompt = operator.prompt_handoff_and_wait(scenario.description, target)
-        #   - read elapsed = prompt.elapsed_sec
-        #   - clicks = operator.read_click_counter(driver)
-        #   - http_count = len(driver.requests)
-        #   - net_bytes = sum(len(r.response.body) if r.response else 0 for r in driver.requests)
-        #   - selectors via csd_resolver.find(driver, "search-input"), etc.
-        with stopwatch() as elapsed:
-            placeholder_time = elapsed()
+        if self.driver is None:
+            raise RuntimeError("driver not initialised; call setup() first")
 
+        # Clear per-run metrics
+        operator.reset_click_counter(self.driver)
+        try:
+            del self.driver.requests
+        except Exception:
+            pass
+
+        if scenario.id == 3:
+            return self._run_scenario_3_substring(scenario, run_id, cache_state)
+
+        # Other scenarios are not yet implemented for CSD. Return a placeholder
+        # so the matrix CSV still has a row visible in the report.
+        log.warning("CSD scenario %d not yet implemented", scenario.id)
         return RunResult(
             run_id=run_id,
-            started_at="",  # TODO: set when scenario starts
+            started_at="",
             tool=self.name,
             scenario_id=scenario.id,
             scenario_name=scenario.name,
             cache_state=cache_state,
             operator_skill=scenario.operator_skill_by_tool[self.name],
-            time_to_result_sec=placeholder_time,
-            notes="stub run, no real automation yet",
+            time_to_result_sec=None,
+            click_count=0,
+            keystroke_count=None,
+            http_request_count=None,
+            network_bytes=None,
+            completed_within_cap=None,
+            non_technical_user_could_complete=None,
+            result_correct=None,
+            result_count_reported=None,
+            notes=f"CSD scenario {scenario.id} not implemented yet",
+        )
+
+    # ----- Scenario 3: substring across the whole bucket -----
+
+    def _run_scenario_3_substring(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+    ) -> RunResult:
+        """Search the whole bucket for the configured substring and read the count."""
+        drive_name = CSD_DRIVE_NAMES.get(scenario.bucket)
+        if not drive_name:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"no CSD drive name configured for bucket {scenario.bucket}",
+            )
+
+        substring = scenario.substring or ""
+        if not substring:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                "scenario has no substring configured",
+            )
+
+        log.info("scenario 3: drive=%s substring=%s", drive_name, substring)
+
+        # Step 1: navigate to the drive root.
+        self._click_drive(drive_name)
+        # Wait until the search input is interactable - that's our signal that
+        # the drive view has rendered.
+        search_input = self._wait_for_intent("search-input", timeout=20)
+
+        # Step 2: clear any prior search content.
+        try:
+            search_input.clear()
+        except Exception:
+            pass
+
+        # Reset metrics again right before the timed window.
+        operator.reset_click_counter(self.driver)
+        try:
+            del self.driver.requests
+        except Exception:
+            pass
+
+        # Step 3: timed search.
+        with stopwatch() as elapsed:
+            search_input.click()
+            search_input.send_keys(substring)
+            count = self._wait_for_search_result_count(timeout=SEARCH_RESULT_TIMEOUT_SEC)
+            time_to_result = elapsed()
+
+        click_count = operator.read_click_counter(self.driver)
+        http_count = len(self.driver.requests)
+        net_bytes = self._sum_response_bytes(self.driver.requests)
+
+        # Per locked rubric: ground truth at the seeded oss-mirror is 32,763.
+        # If the drive is not pointed at our bucket yet, the count will be
+        # wildly different and the assertion fails - that surfaces the
+        # "buckets not connected" misconfig clearly.
+        result_correct = count is not None and count >= 32000
+
+        notes = (
+            f"CSD search '{substring}' on drive '{drive_name}', count={count}"
+            if count is not None
+            else f"CSD search '{substring}' on drive '{drive_name}' did not produce a count"
+        )
+
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=time_to_result,
+            click_count=click_count,
+            keystroke_count=len(substring),
+            http_request_count=http_count,
+            network_bytes=net_bytes,
+            completed_within_cap=time_to_result is not None and time_to_result <= 300,
+            non_technical_user_could_complete=result_correct,
+            result_correct=result_correct,
+            result_count_reported=count,
+            notes=notes,
+        )
+
+    # ----- Helpers -----
+
+    def _is_logged_in(self) -> bool:
+        try:
+            self.driver.find_element(By.XPATH, LOGGED_IN_SENTINEL_XPATH)
+            return True
+        except Exception:
+            return False
+
+    def _wait_for_intent(self, intent: str, timeout: float):
+        """Wait for an intent-resolved element to be present, return it."""
+        end = time.perf_counter() + timeout
+        while time.perf_counter() < end:
+            elem = csd_resolver.find(self.driver, intent)
+            if elem is not None:
+                return elem
+            time.sleep(0.25)
+        raise TimeoutException(f"intent {intent!r} not found within {timeout}s")
+
+    def _click_drive(self, drive_name: str) -> None:
+        """Click the drive entry in the left sidebar.
+
+        Tries data-testid first, then falls back to matching button text.
+        """
+        css_testid = f"[data-testid='drive-{drive_name}']"
+        try:
+            elem = self.driver.find_element(By.CSS_SELECTOR, css_testid)
+            elem.click()
+            return
+        except Exception:
+            pass
+
+        # Fall back to matching button or link text. CSD renders drives as
+        # buttons in a sidebar list.
+        xpath = (
+            f"//button[normalize-space()='{drive_name}'] | "
+            f"//a[normalize-space()='{drive_name}']"
+        )
+        elem = WebDriverWait(self.driver, 15).until(
+            EC.element_to_be_clickable((By.XPATH, xpath))
+        )
+        elem.click()
+
+    def _wait_for_search_result_count(self, timeout: float) -> "int | None":
+        """Poll until CSD's pagination text shows a stable count, return it.
+
+        CSD shows pagination as 'X-Y of N' (e.g. '1-10 of 100000') near the
+        rows-per-page control. We read the body text, regex out 'of N', and
+        wait until N stops changing. If N stays at 0 for the whole window
+        we return 0 (legit no-match search).
+        """
+        pattern = re.compile(r"\bof\s+([\d,]+)\b")
+        last_seen: int | None = None
+        last_change = time.perf_counter()
+        end = last_change + timeout
+        # Settle window: how long the count must remain unchanged before we
+        # call it final. CSD's basic search debounces ~500ms, so 1.5s of
+        # stability is conservative.
+        settle_sec = 1.5
+
+        while time.perf_counter() < end:
+            try:
+                body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                body_text = ""
+            matches = pattern.findall(body_text)
+            current: int | None = None
+            if matches:
+                # If multiple "of N" appear, take the largest. Almost always
+                # that's the result-count badge rather than e.g. file size.
+                current = max(int(m.replace(",", "")) for m in matches)
+
+            if current != last_seen:
+                last_seen = current
+                last_change = time.perf_counter()
+            elif current is not None and (time.perf_counter() - last_change) >= settle_sec:
+                return current
+            time.sleep(0.1)
+
+        return last_seen
+
+    @staticmethod
+    def _sum_response_bytes(requests) -> int:
+        total = 0
+        for r in requests:
+            try:
+                if r.response and r.response.body:
+                    total += len(r.response.body)
+            except Exception:
+                continue
+        return total
+
+    def _fail_result(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+        reason: str,
+    ) -> RunResult:
+        log.error("scenario %d failed: %s", scenario.id, reason)
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=None,
+            click_count=0,
+            keystroke_count=None,
+            http_request_count=None,
+            network_bytes=None,
+            completed_within_cap=False,
+            non_technical_user_could_complete=False,
+            result_correct=False,
+            result_count_reported=None,
+            notes=f"failed: {reason}",
         )

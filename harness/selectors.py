@@ -29,25 +29,37 @@ if TYPE_CHECKING:  # avoid hard selenium import at module load time
     from selenium.webdriver.remote.webelement import WebElement
 
 
-# Intent -> ARIA label text that matches the live CSD UI today.
-# Update when the CSD UI changes; data-testid wins over this when available.
+# Intent -> ARIA label text. Updated 2026-05-03 from live drive.cloudsee.cloud
+# inspection (demoadmin@cloudsee.cloud session). When the CSD UI changes,
+# update this map; when CSD adds data-testid attributes, IntentResolver
+# picks those up automatically without needing to change anything here.
 CSD_INTENT_LABELS: dict[str, str] = {
-    "search-input": "Search files",
-    "fast-buckets-trigger": "Fast Buckets",
+    "search-input": "Search for...",       # placeholder text on the textbox
+    "advanced-search-trigger": "Advanced Search",
     "tag-explorer-trigger": "Tag Explorer",
-    "filter-by-date-range": "Date range",
-    "filter-by-tag": "Tag",
-    "result-count-badge": "Result count",
+    "filters-trigger": "Filters",
+    "ask-ai-trigger": "Ask AI",
+    "clear-search": "Clear",
+    "sign-in-button": "Sign In",
+    "email-input": "Email Address",
+    "password-input": "Password",
     "user-menu": "User menu",
 }
 
-# Last-resort CSS for CSD intents.
+# Last-resort CSS for CSD intents. The result-count is a free-floating text
+# node ("1-10 of 100000") not labelled, so we use position-near-pagination.
 CSD_INTENT_FALLBACKS: dict[str, str] = {
-    "search-input": "input[type='search'], input[placeholder*='Search']",
-    "fast-buckets-trigger": "button:has(span:contains('Fast Buckets'))",
-    "tag-explorer-trigger": "button:has(span:contains('Tag Explorer'))",
-    "result-count-badge": "[class*='result-count'], [class*='ResultCount']",
-    "user-menu": "[class*='user-menu'], [class*='UserMenu'], [class*='avatar']",
+    "search-input": "input[placeholder='Search for...']",
+    "advanced-search-trigger": "button[aria-haspopup]:not([aria-label])",
+    "clear-search": "button[aria-label='Clear']",
+    "sign-in-button": "button[type='submit']",
+    "email-input": "input[type='email']",
+    "password-input": "input[type='password']",
+    # Result count is shown as text like "1-10 of 100000" near the pagination
+    # control. We capture it via XPath in csd_runner because CSS can't
+    # match text content directly.
+    "result-count-badge": "div, span",
+    "user-menu": "header [class*='avatar'], header img, header button:last-child",
 }
 
 # Same shape for the AWS Console.
