@@ -180,7 +180,10 @@ class CsdRunner(Runner):
         if scenario.id == 4:
             return self._run_scenario_4_date_range(scenario, run_id, cache_state)
 
-        # Scenario 5: tag search via Advanced Search > Tag Explorer (TBD).
+        # Scenario 5: tag search via Advanced Search > Tag Explorer.
+        if scenario.id == 5:
+            return self._run_scenario_5_tag_search(scenario, run_id, cache_state)
+
         log.warning("CSD scenario %d not yet implemented", scenario.id)
         return RunResult(
             run_id=run_id,
@@ -233,6 +236,8 @@ class CsdRunner(Runner):
         S3: 10000+ matches (the 'test' substring sweep).
         S4: 100000+ matches (date range covering the seeding window;
             see CSD_S4_DATE_FROM/TO and RUN_CONDITIONS.md for details).
+        S5: 100+ matches (seeded domain=audio count is 3060;
+            slack lets small drift through if tagging re-runs).
         """
         if count is None:
             return False
@@ -244,6 +249,8 @@ class CsdRunner(Runner):
             return count >= 10000
         if scenario.id == 4:
             return count >= 100000
+        if scenario.id == 5:
+            return count >= 100
         return False
 
     def _run_substring_scenario(
@@ -527,6 +534,140 @@ class CsdRunner(Runner):
             f"count={count} (S3 LastModified; CLI runs source-mtime semantic per RUN_CONDITIONS.md)"
             if count is not None
             else f"CSD Filters: Date Updated is between {self.CSD_S4_DATE_FROM}..{self.CSD_S4_DATE_TO} did not produce a count"
+        )
+
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=time_to_result,
+            click_count=click_count,
+            keystroke_count=keystroke_count,
+            http_request_count=None,
+            network_bytes=None,
+            completed_within_cap=time_to_result is not None and time_to_result <= 300,
+            non_technical_user_could_complete=result_correct,
+            result_correct=result_correct,
+            result_count_reported=count,
+            notes=notes,
+        )
+
+    # ----- Scenario 5: tag search via Advanced Search > Tag Explorer -----
+    #
+    # The Tag Explorer dialog shows all tag KEYS at top level (e.g. 'domain'),
+    # each with a chevron. Clicking the key expands its VALUES (e.g. 'audio',
+    # 'image'). Clicking a value toggles its selection. Apply runs the filter.
+    # Spec scenario 5: domain=audio. Seeded count = 3060.
+
+    def _run_scenario_5_tag_search(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+    ) -> RunResult:
+        """Open Tag Explorer, expand the tag key, select the value, apply, read count."""
+        drive_name = CSD_DRIVE_NAMES.get(scenario.bucket)
+        if not drive_name:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"no CSD drive name configured for bucket {scenario.bucket}",
+            )
+
+        tag_key = scenario.tag_key or ""
+        tag_value = scenario.tag_value or ""
+        if not tag_key or not tag_value:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                "scenario 5 has no tag_key/tag_value configured",
+            )
+
+        log.info("scenario 5: drive=%s tag=%s=%s", drive_name, tag_key, tag_value)
+
+        # Reset state, navigate.
+        self._dismiss_search_state()
+        try:
+            self._click_drive(drive_name)
+        except TimeoutException as exc:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"setup_failed: drive click missed - {exc}",
+            )
+        self._wait_for_backdrop_clear(timeout=15)
+
+        if self._search_state_is_stale():
+            log.warning("stale search state detected; refreshing")
+            try:
+                self.driver.refresh()
+            except Exception:
+                pass
+            if not self._is_logged_in(timeout=15):
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    "setup_failed: not signed in after refresh",
+                )
+            self._dismiss_search_state()
+            try:
+                self._click_drive(drive_name)
+            except TimeoutException as exc:
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    f"setup_failed: drive click missed after refresh - {exc}",
+                )
+            self._wait_for_backdrop_clear(timeout=15)
+
+        operator.reset_click_counter(self.driver)
+        baseline_count = self._read_pagination_count()
+        log.info("pre-tag-filter pagination count = %s", baseline_count)
+
+        # Timed window
+        with stopwatch() as elapsed:
+            current_step = "init"
+            try:
+                current_step = "open_tag_explorer"
+                self._open_tag_explorer_dialog()
+                current_step = "expand_tag_key"
+                self._expand_tag_key(tag_key)
+                current_step = "select_tag_value"
+                self._select_tag_value(tag_value)
+                current_step = "click_apply_tag"
+                self._click_apply_tag_explorer()
+                current_step = "wait_count"
+                count = self._wait_for_search_result_count(
+                    timeout=SEARCH_RESULT_TIMEOUT_SEC,
+                    baseline=baseline_count,
+                )
+            except Exception as exc:  # noqa: BLE001
+                time_to_result = elapsed()
+                exc_type = type(exc).__name__
+                msg = str(exc)[:200].replace("\n", " ")
+                log.error("scenario 5 failed in step=%s exc=%s msg=%s",
+                          current_step, exc_type, msg)
+                try:
+                    from pathlib import Path as _P
+                    _P("results").mkdir(parents=True, exist_ok=True)
+                    self.driver.save_screenshot(f"results/debug-s5-fail-{current_step}.png")
+                except Exception:
+                    pass
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    f"scenario 5 step={current_step} {exc_type}: {msg}",
+                )
+            time_to_result = elapsed()
+
+        click_count = operator.read_click_counter(self.driver)
+        # Keystrokes: zero (Tag Explorer is mouse-only for value selection).
+        keystroke_count = 0
+
+        result_correct = self._validate_count(scenario, count)
+        notes = (
+            f"CSD Tag Explorer: {tag_key}={tag_value}, count={count} "
+            f"(seeded count is 3060; CLI runs inline boto3 parallel get_object_tagging)"
+            if count is not None
+            else f"CSD Tag Explorer: {tag_key}={tag_value} did not produce a count"
         )
 
         return RunResult(
@@ -1119,6 +1260,127 @@ class CsdRunner(Runner):
             el, value,
         )
 
+    # ----- Advanced Search > Tag Explorer helpers (used by scenario 5) -----
+
+    def _open_tag_explorer_dialog(self) -> None:
+        """Click Advanced Search > Tag Explorer to open the tag-filter dialog."""
+        adv = WebDriverWait(self.driver, 10).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//button[normalize-space(.)='Advanced Search']")
+            )
+        )
+        self.driver.execute_script("arguments[0].click();", adv)
+        log.info("scenario 5: clicked Advanced Search")
+        item = WebDriverWait(self.driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//*[@role='menuitem' or self::li or self::button]"
+                 "[normalize-space(.)='Tag Explorer']")
+            )
+        )
+        self.driver.execute_script("arguments[0].click();", item)
+        log.info("scenario 5: clicked Tag Explorer menuitem")
+        # Wait for the Tag Explorer dialog (it has an Apply button).
+        WebDriverWait(self.driver, 12).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//div[contains(@class, 'MuiDialog-paper')]"
+                 "//button[normalize-space(.)='Apply']")
+            )
+        )
+        log.info("scenario 5: tag explorer dialog open")
+
+    def _expand_tag_key(self, key: str) -> None:
+        """Click the tag key row to expand its values."""
+        end = time.perf_counter() + 8
+        target = None
+        while time.perf_counter() < end:
+            cands = self.driver.find_elements(
+                By.XPATH,
+                f"//div[contains(@class, 'MuiDialog-paper')]"
+                f"//*[normalize-space(text())='{key}']"
+            )
+            visible = [c for c in cands if c.is_displayed()]
+            if visible:
+                target = visible[0]
+                break
+            time.sleep(0.2)
+        if target is None:
+            raise TimeoutException(f"tag key {key!r} never appeared in Tag Explorer")
+        log.info("scenario 5: expanding tag key %r", key)
+        self._native_click(target)
+        time.sleep(0.6)  # let the collapse animation play
+
+    def _select_tag_value(self, value: str) -> None:
+        """Click the tag value sub-row to toggle its selection."""
+        end = time.perf_counter() + 8
+        target = None
+        while time.perf_counter() < end:
+            cands = self.driver.find_elements(
+                By.XPATH,
+                f"//div[contains(@class, 'MuiDialog-paper')]"
+                f"//*[normalize-space(text())='{value}']"
+            )
+            visible = [c for c in cands if c.is_displayed()]
+            if visible:
+                target = visible[0]
+                break
+            time.sleep(0.2)
+        if target is None:
+            raise TimeoutException(f"tag value {value!r} never appeared after expand")
+        log.info("scenario 5: selecting tag value %r", value)
+        self._native_click(target)
+        time.sleep(0.4)
+
+    def _click_apply_tag_explorer(self) -> None:
+        """Click the Apply button in the Tag Explorer dialog (button text='Apply').
+
+        Note: Tag Explorer's Apply button reads 'Apply' (not 'Apply filters'
+        like the Filters dialog). Same robustness pattern: CDP click first,
+        Selenium .click() fallback, dialog-close as success signal.
+        """
+        time.sleep(0.4)
+        btn = WebDriverWait(self.driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//div[contains(@class, 'MuiDialog-paper')]"
+                 "//button[normalize-space(.)='Apply']")
+            )
+        )
+        self._native_click(btn)
+        end = time.perf_counter() + 5
+        while time.perf_counter() < end:
+            still_open = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//button[normalize-space(.)='Apply']"
+            )
+            if not still_open:
+                log.info("scenario 5: tag explorer dialog closed after CDP apply")
+                return
+            time.sleep(0.2)
+        log.info("scenario 5: dialog still open after CDP apply; trying Selenium click")
+        try:
+            btn2 = self.driver.find_element(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//button[normalize-space(.)='Apply']"
+            )
+            btn2.click()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Selenium tag apply click also failed: %s", exc)
+        end = time.perf_counter() + 5
+        while time.perf_counter() < end:
+            still_open = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//button[normalize-space(.)='Apply']"
+            )
+            if not still_open:
+                return
+            time.sleep(0.2)
+        log.warning("scenario 5: Apply click did not close tag explorer dialog")
+
     def _click_apply_filters(self) -> None:
         """Click the Apply filters button - CDP first, then Selenium .click() fallback.
 
@@ -1136,26 +1398,6 @@ class CsdRunner(Runner):
                 (By.XPATH, "//button[normalize-space(.)='Apply filters']")
             )
         )
-        # Diagnostic: log button enabled state and current date input values.
-        try:
-            disabled = btn.get_attribute("disabled")
-            log.info("scenario 4: Apply button disabled=%r", disabled)
-            inputs = self.driver.find_elements(
-                By.XPATH,
-                "//div[contains(@class, 'MuiDialog-paper')]"
-                "//input[@placeholder='MM/DD/YYYY']"
-            )
-            for i, inp in enumerate(inputs):
-                if inp.is_displayed():
-                    log.info("scenario 4: date input[%d] value=%r", i, inp.get_attribute("value"))
-        except Exception as exc:  # noqa: BLE001
-            log.debug("apply-state diagnostic failed: %s", exc)
-        try:
-            from pathlib import Path as _P
-            _P("results").mkdir(parents=True, exist_ok=True)
-            self.driver.save_screenshot("results/debug-s4-pre-apply.png")
-        except Exception:
-            pass
         self._native_click(btn)
         # Wait for the dialog to close as a signal that the apply succeeded.
         end = time.perf_counter() + 5

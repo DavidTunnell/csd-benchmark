@@ -1,0 +1,2 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260504T005858Z,,csd,5,tag-search,cold,non-technical,5.955074900004547,6,0,,,true,true,true,3060,"CSD Tag Explorer: domain=audio, count=3060 (seeded count is 3060; CLI runs inline boto3 parallel get_object_tagging)"
