@@ -352,19 +352,36 @@ class CsdRunner(Runner):
         log.info("pre-search pagination count = %s", baseline_count)
 
         # Step 3: timed search.
-        # We type via Chrome DevTools Protocol so the keystrokes look real
-        # to CSD's MUI search input. The wait then watches for the count
-        # to change off the baseline, which is how we detect the search
-        # has actually fired.
+        # Set the input value via the React-bypass HTMLInputElement.value
+        # setter, then dispatch native 'input' and 'change' events so
+        # CSD's onChange handler fires. This replaces an earlier path that
+        # used ActionChains.click() + per-character CDP keystrokes; that
+        # path had two problems:
+        #   1. ActionChains move-to-element click took ~1-2 seconds of
+        #      mouse-animation overhead inside the timed window, inflating
+        #      every CSD measurement by that amount.
+        #   2. CDP keystrokes targeted at the page (not the focused element)
+        #      occasionally landed on the wrong widget after a page reflow,
+        #      leaving the search un-fired. Across the prior CSD S3 runs
+        #      this manifested as a ~36% failure rate where the wait
+        #      function timed out at the baseline (5 or 150001) instead of
+        #      moving to the actual result count.
+        # The React-bypass setter is the same pattern other React form
+        # libraries use to programmatically update controlled inputs;
+        # CSD's MUI TextField listens for the dispatched 'input' event.
         with stopwatch() as elapsed:
-            ActionChains(self.driver).move_to_element(search_input).click().perform()
-            for ch in substring:
-                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                    "type": "keyDown", "text": ch
-                })
-                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
-                    "type": "keyUp", "text": ch
-                })
+            self.driver.execute_script(
+                "var el = arguments[0];"
+                " el.scrollIntoView({block: 'center'});"
+                " el.focus();"
+                " var setter = Object.getOwnPropertyDescriptor("
+                "   window.HTMLInputElement.prototype, 'value').set;"
+                " setter.call(el, arguments[1]);"
+                " el.dispatchEvent(new Event('input', {bubbles: true}));"
+                " el.dispatchEvent(new Event('change', {bubbles: true}));",
+                search_input,
+                substring,
+            )
             count = self._wait_for_search_result_count(
                 timeout=SEARCH_RESULT_TIMEOUT_SEC,
                 baseline=baseline_count,
