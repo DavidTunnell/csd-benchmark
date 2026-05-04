@@ -345,7 +345,24 @@ class ConsoleRunner(Runner):
                 ),
             )
 
-        # Scenarios 2, 3, 4: implementations land in their own commits.
+        if scenario.id == 2:
+            # Six folders deep, full path known. The operator either pastes
+            # the path into the Console's prefix search or clicks folder by
+            # folder. Both flows end at the same target file; the helper
+            # times whichever the operator actually uses.
+            return self._run_find_target_via_handoff(
+                scenario=scenario,
+                run_id=run_id,
+                cache_state=cache_state,
+                page_url=_console_bucket_url(scenario.bucket),
+                target_hint=(
+                    "find file '" + (scenario.target_key or "") + "' "
+                    "(6+ folders deep in " + scenario.bucket + "; "
+                    "full path known)"
+                ),
+            )
+
+        # Scenarios 3, 4: implementations land in their own commits.
         return RunResult(
             run_id=run_id,
             started_at="",
