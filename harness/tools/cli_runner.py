@@ -85,43 +85,45 @@ class CliRunner(Runner):
         )
 
     def run(self, scenario: Scenario, run_id: str, cache_state: str) -> RunResult:
-        aws = _aws_path()
         notes = ""
         result_correct = None
         time_to_result = None
         completed = None
+        count_reported = None
 
-        if scenario.id == 1:
-            # Direct head-object - the CLI knows the key, no search needed.
-            cmd = [aws, "s3api", "head-object", "--bucket", scenario.bucket, "--key", scenario.target_key]
-            with stopwatch() as elapsed:
-                proc = self._run_cmd(cmd, timeout=60)
-                time_to_result = elapsed()
-            result_correct = proc.returncode == 0
-            completed = True
+        if scenario.id in (1, 2):
+            # Fairness adjustment (RUN_CONDITIONS.md): the user knows the
+            # filename, not the full S3 key. The CLI must scan the bucket to
+            # locate it, the same kind of work it does natively for scenario
+            # 3. Previously this path used `aws s3api head-object` which
+            # required the runner to already know the full key, an unfair
+            # advantage that didn't reflect the realistic CLI workflow.
+            filename = os.path.basename(scenario.target_key or "")
+            if not filename:
+                count = None
+                elapsed_sec = None
+            else:
+                count, elapsed_sec = self._count_substring_via_ls(
+                    scenario.bucket, filename
+                )
+            time_to_result = elapsed_sec
+            count_reported = count
+            completed = elapsed_sec is not None
+            # We seed exactly one match in each bucket; tolerate >=1 in case
+            # an OSS pin ever happens to ship two files with the same basename.
+            result_correct = (count is not None and count >= 1)
             notes = (
-                f"aws s3api head-object on s3://{scenario.bucket}/{scenario.target_key}"
-                if result_correct
-                else f"head-object failed: {proc.stderr.strip()[:200]}"
-            )
-        elif scenario.id == 2:
-            cmd = [aws, "s3api", "head-object", "--bucket", scenario.bucket, "--key", scenario.target_key]
-            with stopwatch() as elapsed:
-                proc = self._run_cmd(cmd, timeout=60)
-                time_to_result = elapsed()
-            result_correct = proc.returncode == 0
-            completed = True
-            notes = (
-                f"aws s3api head-object on s3://{scenario.bucket}/{scenario.target_key}"
-                if result_correct
-                else f"head-object failed: {proc.stderr.strip()[:200]}"
+                f"aws s3 ls --recursive piped through grep '{filename}', "
+                f"counted {count} matches"
             )
         elif scenario.id == 3:
             # `aws s3 ls --recursive` returns one line per object. We pipe to
             # findstr (Windows) or grep (Unix) to count substring matches. We
             # measure both phases as one wall time because that's the actual
             # CLI workflow.
-            count, elapsed_sec = self._scenario_3_count_substring(scenario)
+            count, elapsed_sec = self._count_substring_via_ls(
+                scenario.bucket, scenario.substring or ""
+            )
             time_to_result = elapsed_sec
             count_reported = count
             completed = elapsed_sec is not None
@@ -129,7 +131,10 @@ class CliRunner(Runner):
             # tolerate small drift from concurrent inventory regeneration etc.
             min_expected = 32000
             result_correct = (count is not None and count >= min_expected)
-            notes = f"aws s3 ls --recursive piped through grep '{scenario.substring}', counted {count} matches"
+            notes = (
+                f"aws s3 ls --recursive piped through grep '{scenario.substring}', "
+                f"counted {count} matches"
+            )
         elif scenario.id == 4:
             # CLI users `aws s3 cp` the inventory sidecar then filter rows.
             # We measure both download + filter as one wall time.
@@ -176,26 +181,31 @@ class CliRunner(Runner):
             completed_within_cap=(completed and time_to_result is not None and time_to_result <= 300),
             non_technical_user_could_complete=False,  # CLI is technical by definition
             result_correct=result_correct,
-            result_count_reported=count_reported if scenario.id in (3, 4, 5) else None,
+            result_count_reported=count_reported,
             notes=notes or "ok",
         )
 
     # ----- Per-scenario implementations -----
 
-    def _scenario_3_count_substring(self, scenario: Scenario) -> tuple[int | None, float | None]:
+    def _count_substring_via_ls(
+        self, bucket: str, substring: str
+    ) -> tuple[int | None, float | None]:
         """Run `aws s3 ls --recursive` then count lines containing the substring.
 
         We deliberately use `aws s3 ls --recursive` (not list-objects-v2 with
         --query) because that's what a real CLI user reaches for first.
+
+        Used by scenarios 1, 2 (substring is the target filename's basename)
+        and scenario 3 (substring is the literal search term).
         """
         aws = _aws_path()
-        substring = (scenario.substring or "").lower()
+        substring = (substring or "").lower()
         if not substring:
             return None, None
 
         with stopwatch() as elapsed:
             proc = subprocess.run(
-                [aws, "s3", "ls", f"s3://{scenario.bucket}/", "--recursive"],
+                [aws, "s3", "ls", f"s3://{bucket}/", "--recursive"],
                 env=self._env,
                 check=False,
                 capture_output=True,

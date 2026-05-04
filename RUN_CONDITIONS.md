@@ -7,7 +7,7 @@ These are the rules the official benchmark runs follow. They live in the same re
 | Tool | How it runs | Operator skill assumption |
 | :---- | :---- | :---- |
 | AWS Console | Headed Chrome session, human-supervised, scripted clicks where bot detection allows, manual fallback otherwise | Non-technical |
-| AWS CLI | `aws s3 ls` and friends, timed with `time`, captured to logs | Technical |
+| AWS CLI | `aws s3 ls --recursive` piped through grep/findstr to locate files by filename. Timed with Python's perf_counter, captured to logs. The CLI is given the same information as the human user — the filename, not the full S3 key — and must scan the bucket to find it. | Technical |
 | CloudSee Drive | Headed Chrome session driven by Selenium against `https://drive.cloudsee.cloud` | Non-technical |
 
 ## Fairness rules
@@ -36,8 +36,8 @@ These are the rules the official benchmark runs follow. They live in the same re
 
 | # | Scenario | Target |
 | :---- | :---- | :---- |
-| 1 | Find a file on page ~500 of a flat 150k-object bucket | Pre-known filename at object index ~149,500 in `csd-benchmark-flat-150k` |
-| 2 | Find a file 6+ folders deep, full path known | `linux/v6.10/arch/arm64/boot/dts/freescale/imx8mq-evk.dts` in `csd-benchmark-oss-mirror` |
+| 1 | Find a file on page ~500 of a flat 150k-object bucket | Filename `needle-quarterly-report-2024-Q4.pdf` at object index ~149,500 in `csd-benchmark-flat-150k`. User knows the filename, not the full key. |
+| 2 | Find a file 6+ folders deep | Filename `imx8mq-evk.dts` (full path `linux/v6.10/arch/arm64/boot/dts/freescale/imx8mq-evk.dts`) in `csd-benchmark-oss-mirror`. User knows the filename, not the full key. |
 | 3 | Find files by partial filename across the whole bucket | Substring `test` in `csd-benchmark-oss-mirror`. CLI grep on full key matches 32,763; CSD's filename-only match yields 11,457. Both are valid for their tools and reported alongside the time. |
 | 4 | Find a file modified in a specific date range | CLI filters the inventory CSV's `source_mtime` column by `2024-01-01..2024-12-31` (Linux v6.10 commit dates: ~85k matches). CSD filters S3 `LastModified` via Advanced Search > Filters by `2025-01-01..2026-12-31` (the seeding window: all ~155k objects). The two tools answer "find files in a date range" against their respective data models; documented per-tool in the runner notes. |
 | 5 | Find files by tag (`domain=audio`) | Tagged subset of audio files under `linux/v6.10/sound/` and TensorFlow audio paths. Seeded count: 3,060. CSD uses Advanced Search > Tag Explorer; CLI requires inline boto3 with parallel `get_object_tagging` calls (canonical "you have to write code" workaround per spec). |
@@ -49,6 +49,8 @@ Scenario 3 median time-to-result. The Console literally cannot do this search na
 ## Per-scenario data-source notes
 
 A few scenarios surface a difference between what each tool can natively measure. We don't paper over these; we document them and report each tool's answer in its own data model.
+
+- **Scenarios 1 and 2 (find a file by filename).** The user knows the file's name but not its full S3 key. All three tools must locate the file from the filename alone. CLI uses `aws s3 ls s3://bucket --recursive` and filters lines by the filename, the same kind of work it does for Scenario 3. We deliberately do not use `aws s3api head-object` here, even though it would be faster, because head-object requires the runner to already know the full key, an unfair advantage that does not reflect the realistic CLI workflow when the user knows only the filename. The expected match count is exactly 1 for both scenarios; the seeded buckets contain a single file with each target basename. The headline UX claim — *can the user find the file by typing its name?* — is what we measure.
 
 - **Scenario 3 ("test" substring).** CSD's basic search matches the filename portion of each S3 key only, returning 11,457. The CLI's `aws s3 ls --recursive | grep test` matches anywhere in the full key including directory names, returning 32,763. Both numbers are correct for what the user asked their tool to do.
 
