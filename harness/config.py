@@ -49,6 +49,16 @@ CSD_CHROME_DEBUGGER_ADDRESS = os.environ.get(
     "CSD_BENCHMARK_CHROME_DEBUGGER_ADDRESS", "localhost:9222"
 )
 
+# Same pattern for the AWS Console runner. Distinct default port so the
+# operator can run a CSD Chrome and a Console Chrome side-by-side, each on
+# its own user-data-dir, each pre-authenticated. Bot detection on the AWS
+# Console is aggressive enough that letting Selenium spin up its own Chrome
+# is unreliable; attaching to an operator-launched window matches how a real
+# user signs in (manual login, then leaves the tab open).
+AWS_CONSOLE_CHROME_DEBUGGER_ADDRESS = os.environ.get(
+    "CSD_BENCHMARK_CONSOLE_CHROME_DEBUGGER_ADDRESS", "localhost:9223"
+)
+
 # 5-minute soft cap on time-to-result, per spec.
 TIMEOUT_SOFT_CAP_SEC = 300
 
