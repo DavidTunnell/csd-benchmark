@@ -338,6 +338,39 @@ class ConsoleRunner(Runner):
                 ),
             )
 
+        if scenario.id == 3:
+            # Scenario 3 is bucket-wide substring search ("test" across all
+            # ~155k objects). The Console's "Find objects by prefix" input
+            # is starts-with against the rest of the key after the current
+            # prefix, not a substring match. None of the oss-mirror root
+            # keys start with "test" (they start with linux/, kubernetes/,
+            # react/, tensorflow/, _meta/), so the search at root returns
+            # zero. Drilling into each folder and re-searching there would
+            # find some matches but never the bucket-wide ~32k that CLI
+            # grep returns. Per RUN_MATRIX.md this is a structural failure
+            # we record rather than attempt; it mirrors how scenario 5
+            # short-circuits for the same reason.
+            return RunResult(
+                run_id=run_id,
+                started_at="",
+                tool=self.name,
+                scenario_id=scenario.id,
+                scenario_name=scenario.name,
+                cache_state=cache_state,
+                operator_skill=scenario.operator_skill_by_tool[self.name],
+                time_to_result_sec=None,
+                completed_within_cap=False,
+                non_technical_user_could_complete=False,
+                result_correct=False,
+                result_count_reported=0,
+                notes=(
+                    "AWS Console prefix search is starts-with at the current "
+                    "prefix, not a bucket-wide substring search. Cannot match "
+                    "'test' across all keys. Documented structural failure "
+                    "(per RUN_MATRIX.md)."
+                ),
+            )
+
         if scenario.id == 1:
             return self._run_find_target_via_handoff(
                 scenario=scenario,
