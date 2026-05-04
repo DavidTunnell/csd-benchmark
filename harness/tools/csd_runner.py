@@ -219,12 +219,58 @@ class CsdRunner(Runner):
 
         log.info("scenario 3: drive=%s substring=%s", drive_name, substring)
 
+        # Step 0 (fix #1): dismiss any leftover search state from the prior run
+        # before we navigate. Without this, warm runs land on the previous
+        # drive's results view with the search chip still rendered and the
+        # search input value stuck. The next click_drive then no-ops because
+        # we're already on the drive, leaving stale state in place.
+        self._dismiss_search_state()
+
         # Step 1: navigate to the drive root.
-        self._click_drive(drive_name)
+        # Fix #2: if the click misses every strategy, abort the run cleanly
+        # rather than recording a 35s timeout against a stale baseline count.
+        try:
+            self._click_drive(drive_name)
+        except TimeoutException as exc:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"setup_failed: drive click missed - {exc}",
+            )
         # MUI dialogs and drawers leave invisible backdrops in the DOM during
         # transitions; they intercept clicks even at opacity 0. Wait for the
         # backdrop to be gone before interacting with the search input.
         self._wait_for_backdrop_clear(timeout=15)
+
+        # Fix #3: if a stale chip survived the click_drive (because we were
+        # already on the drive and the click was a no-op), refresh the page
+        # once and re-click. After refresh, if state is *still* stale, fail
+        # clean instead of measuring against bad state.
+        if self._search_state_is_stale():
+            log.warning("stale search state detected after click_drive; refreshing once")
+            try:
+                self.driver.refresh()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("refresh failed: %s", exc)
+            if not self._is_logged_in(timeout=15):
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    "setup_failed: not signed in after refresh fallback",
+                )
+            self._dismiss_search_state()
+            try:
+                self._click_drive(drive_name)
+            except TimeoutException as exc:
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    f"setup_failed: drive click missed after refresh - {exc}",
+                )
+            self._wait_for_backdrop_clear(timeout=15)
+            if self._search_state_is_stale():
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    "setup_failed: search state still stale after refresh",
+                )
+
         # Wait until the search input is interactable - that's our signal that
         # the drive view has rendered.
         search_input = self._wait_for_intent("search-input", timeout=20)
@@ -323,6 +369,123 @@ class CsdRunner(Runner):
                 if time.perf_counter() >= end:
                     return False
                 time.sleep(0.25)
+
+    def _dismiss_search_state(self) -> None:
+        """Clear any leftover chip / search-input value from a prior run.
+
+        Idempotent: safe to call when nothing is set. Strategies, in order:
+          1. Send Escape twice via CDP - dismisses popovers/menus/dropdowns.
+          2. Click any visible MUI chip's delete (X) button - removes the
+             persistent search-term chip CSD shows after a search completes.
+          3. Force-clear every input that looks like a search box: set
+             .value='' and dispatch input + change events so React updates
+             its controlled state.
+        """
+        # 1. Escape any open popover/menu.
+        try:
+            for _ in range(2):
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "key": "Escape", "code": "Escape",
+                    "windowsVirtualKeyCode": 27,
+                })
+                self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                    "type": "keyUp", "key": "Escape", "code": "Escape",
+                    "windowsVirtualKeyCode": 27,
+                })
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dismiss_search_state: Escape dispatch failed: %s", exc)
+
+        # 2. Click any chip delete buttons.
+        try:
+            chip_xes = self.driver.find_elements(
+                By.CSS_SELECTOR, ".MuiChip-deleteIcon, .MuiChip-root [data-testid='CancelIcon']"
+            )
+            for x in chip_xes:
+                try:
+                    self.driver.execute_script("arguments[0].click();", x)
+                except Exception:
+                    continue
+            if chip_xes:
+                log.info("dismiss_search_state: removed %d chip(s)", len(chip_xes))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dismiss_search_state: chip removal failed: %s", exc)
+
+        # 3. Force-clear any search-looking input via JS (so React state updates).
+        try:
+            self.driver.execute_script(
+                """
+                const sels = [
+                    "input[placeholder='Search for...']",
+                    "input[type='search']",
+                    "[data-testid='search-input']"
+                ];
+                let cleared = 0;
+                for (const sel of sels) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (el.value) {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            ).set;
+                            setter.call(el, '');
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            cleared++;
+                        }
+                    }
+                }
+                return cleared;
+                """
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("dismiss_search_state: JS clear failed: %s", exc)
+
+    def _search_state_is_stale(self) -> bool:
+        """Return True if leftover search state is still present.
+
+        We treat the state as stale if EITHER a MUI chip is currently rendered
+        OR any of the candidate search inputs has a non-empty value attribute.
+        That covers both the "chip still up" and "input still has the prior
+        query" failure modes we saw in the prod N=20 run.
+        """
+        try:
+            chips = self.driver.find_elements(
+                By.CSS_SELECTOR, ".MuiChip-root.MuiChip-deletable"
+            )
+            if chips:
+                # Filter to ones that are visible-ish (have non-zero size).
+                for c in chips:
+                    try:
+                        if c.is_displayed():
+                            log.info("stale check: visible MuiChip detected")
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        try:
+            stuck = self.driver.execute_script(
+                """
+                const sels = [
+                    "input[placeholder='Search for...']",
+                    "input[type='search']",
+                    "[data-testid='search-input']"
+                ];
+                for (const sel of sels) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (el.value && el.value.length > 0) return true;
+                    }
+                }
+                return false;
+                """
+            )
+            if stuck:
+                log.info("stale check: search input has non-empty value")
+                return True
+        except Exception:
+            pass
+
+        return False
 
     def _wait_for_backdrop_clear(self, timeout: float) -> None:
         """Wait until any MUI backdrop element is no longer in the DOM.
