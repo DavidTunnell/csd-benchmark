@@ -168,11 +168,17 @@ class CsdRunner(Runner):
         # Clear per-run metrics
         operator.reset_click_counter(self.driver)
 
-        if scenario.id == 3:
-            return self._run_scenario_3_substring(scenario, run_id, cache_state)
+        # Scenarios 1, 2, 3 all share the same UX: click drive, type a
+        # filename or substring into the basic search box, read the count.
+        # The runner branches inside _run_substring_scenario based on what
+        # to type and how to validate, but the timing path is identical
+        # so the comparison stays apples-to-apples.
+        if scenario.id in (1, 2, 3):
+            return self._run_substring_scenario(scenario, run_id, cache_state)
 
-        # Other scenarios are not yet implemented for CSD. Return a placeholder
-        # so the matrix CSV still has a row visible in the report.
+        # Scenarios 4 (date range via Advanced Search) and 5 (tag search via
+        # Tag Explorer) use different CSD UI flows; implemented separately.
+        # Stub returns a placeholder row so the matrix CSV still has a slot.
         log.warning("CSD scenario %d not yet implemented", scenario.id)
         return RunResult(
             run_id=run_id,
@@ -194,15 +200,58 @@ class CsdRunner(Runner):
             notes=f"CSD scenario {scenario.id} not implemented yet",
         )
 
-    # ----- Scenario 3: substring across the whole bucket -----
+    # ----- Per-scenario search-string + validation rubric -----
 
-    def _run_scenario_3_substring(
+    def _search_string_for(self, scenario: Scenario) -> str:
+        """Return the substring a non-technical user would type for this scenario.
+
+        S1: user knows the filename, types a distinctive part. We pick the
+            'needle' prefix on the seeded needle file - unique, minimal.
+        S2: user knows the deep file, types the filename without extension.
+        S3: substring is configured directly on the scenario.
+        """
+        if scenario.id == 3:
+            return scenario.substring or ""
+        if scenario.id == 1 and scenario.target_key:
+            # target_key is the file basename in the flat bucket. Type the
+            # 'needle-quarterly' portion - what a user would actually recall.
+            return "needle-quarterly"
+        if scenario.id == 2 and scenario.target_key:
+            # target_key is a deep path. Type the filename only.
+            basename = scenario.target_key.rsplit("/", 1)[-1]  # imx8mq-evk.dts
+            # Drop the extension - users typically know the name part.
+            return basename.rsplit(".", 1)[0]  # imx8mq-evk
+        return ""
+
+    def _validate_count(self, scenario: Scenario, count: "int | None") -> bool:
+        """Per-scenario rubric: did the search return the right answer?
+
+        S1: exact-1 match (the seeded needle file).
+        S2: at least 1 match (the deep file).
+        S3: 10000+ matches (the 'test' substring sweep).
+        """
+        if count is None:
+            return False
+        if scenario.id == 1:
+            return count == 1
+        if scenario.id == 2:
+            return count >= 1
+        if scenario.id == 3:
+            return count >= 10000
+        return False
+
+    def _run_substring_scenario(
         self,
         scenario: Scenario,
         run_id: str,
         cache_state: str,
     ) -> RunResult:
-        """Search the whole bucket for the configured substring and read the count."""
+        """Click drive, type substring into basic search, read result count.
+
+        Shared implementation for scenarios 1, 2, 3 - all three are 'user
+        knows what they're looking for and types it'. The substring and the
+        validation rubric vary per scenario; the timed path does not.
+        """
         drive_name = CSD_DRIVE_NAMES.get(scenario.bucket)
         if not drive_name:
             return self._fail_result(
@@ -210,14 +259,14 @@ class CsdRunner(Runner):
                 f"no CSD drive name configured for bucket {scenario.bucket}",
             )
 
-        substring = scenario.substring or ""
+        substring = self._search_string_for(scenario)
         if not substring:
             return self._fail_result(
                 scenario, run_id, cache_state,
-                "scenario has no substring configured",
+                "scenario has no usable search string",
             )
 
-        log.info("scenario 3: drive=%s substring=%s", drive_name, substring)
+        log.info("scenario %d: drive=%s substring=%s", scenario.id, drive_name, substring)
 
         # Step 0 (fix #1): dismiss any leftover search state from the prior run
         # before we navigate. Without this, warm runs land on the previous
@@ -316,17 +365,21 @@ class CsdRunner(Runner):
         http_count = None
         net_bytes = None
 
-        # CSD and the CLI define "match" differently. The CLI grep treats
-        # any 'test' substring in the full S3 key as a match (32,763 hits).
-        # CSD matches against the filename portion only, which yields 11,457
-        # in our seeded bucket. Both are correct interpretations; the
-        # benchmark reports both numbers with notes documenting the per-tool
-        # rubric so the comparison stays apples-to-apples.
-        result_correct = count is not None and count >= 10000
+        # Per-scenario validation rubric. CSD and the CLI define "match"
+        # differently for scenario 3 (CSD matches by filename, CLI grep by
+        # full key); for scenarios 1 and 2 both tools are looking for the
+        # same known file so the rubric is exact-1 / at-least-1.
+        result_correct = self._validate_count(scenario, count)
 
+        if scenario.id == 3:
+            match_note = (
+                "CSD matches by filename; CLI grep on s3 ls matches by full key"
+            )
+        else:
+            match_note = "CSD substring match against filename"
         notes = (
             f"CSD search '{substring}' on drive '{drive_name}', count={count} "
-            f"(CSD matches by filename; CLI grep on s3 ls matches by full key)"
+            f"({match_note})"
             if count is not None
             else f"CSD search '{substring}' on drive '{drive_name}' did not produce a count"
         )

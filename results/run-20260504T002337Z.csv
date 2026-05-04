@@ -1,0 +1,2 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260504T002337Z,,csd,2,six-folders-deep,cold,non-technical,5.839838499989128,1,10,,,true,true,true,1,"CSD search 'imx8mq-evk' on drive 'csd-benchmark-oss-mirror', count=1 (CSD substring match against filename)"
