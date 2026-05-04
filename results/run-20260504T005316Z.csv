@@ -1,0 +1,2 @@
+run_id,started_at,tool,scenario_id,scenario_name,cache_state,operator_skill,time_to_result_sec,click_count,keystroke_count,http_request_count,network_bytes,completed_within_cap,non_technical_user_could_complete,result_correct,result_count_reported,notes
+run-20260504T005316Z,,csd,4,date-range,cold,non-technical,6.009098499984248,7,20,,,true,true,true,155491,"CSD Filters: Date Updated is between 01/01/2025..12/31/2026, count=155491 (S3 LastModified; CLI runs source-mtime semantic per RUN_CONDITIONS.md)"

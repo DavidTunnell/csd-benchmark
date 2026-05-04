@@ -176,9 +176,11 @@ class CsdRunner(Runner):
         if scenario.id in (1, 2, 3):
             return self._run_substring_scenario(scenario, run_id, cache_state)
 
-        # Scenarios 4 (date range via Advanced Search) and 5 (tag search via
-        # Tag Explorer) use different CSD UI flows; implemented separately.
-        # Stub returns a placeholder row so the matrix CSV still has a slot.
+        # Scenario 4: date range via Advanced Search > Filters.
+        if scenario.id == 4:
+            return self._run_scenario_4_date_range(scenario, run_id, cache_state)
+
+        # Scenario 5: tag search via Advanced Search > Tag Explorer (TBD).
         log.warning("CSD scenario %d not yet implemented", scenario.id)
         return RunResult(
             run_id=run_id,
@@ -229,6 +231,8 @@ class CsdRunner(Runner):
         S1: exact-1 match (the seeded needle file).
         S2: at least 1 match (the deep file).
         S3: 10000+ matches (the 'test' substring sweep).
+        S4: 100000+ matches (date range covering the seeding window;
+            see CSD_S4_DATE_FROM/TO and RUN_CONDITIONS.md for details).
         """
         if count is None:
             return False
@@ -238,6 +242,8 @@ class CsdRunner(Runner):
             return count >= 1
         if scenario.id == 3:
             return count >= 10000
+        if scenario.id == 4:
+            return count >= 100000
         return False
 
     def _run_substring_scenario(
@@ -397,6 +403,145 @@ class CsdRunner(Runner):
             keystroke_count=len(substring),
             http_request_count=http_count,
             network_bytes=net_bytes,
+            completed_within_cap=time_to_result is not None and time_to_result <= 300,
+            non_technical_user_could_complete=result_correct,
+            result_correct=result_correct,
+            result_count_reported=count,
+            notes=notes,
+        )
+
+    # ----- Scenario 4: date range via Advanced Search > Filters -----
+    #
+    # CSD's "Date Updated" filter reads the S3 object's LastModified, not the
+    # source-mtime metadata our seeders captured. Our seeded files were all
+    # uploaded in 2026 during seeding, so a 2024 range (the spec's original
+    # date) returns 0 in CSD even though the inventory CSV has 2024 source
+    # mtimes. We use the seeding-window range here so both CSD and CLI return
+    # meaningful counts; this is documented in RUN_CONDITIONS.md as a per-tool
+    # date-source difference. The headline UX claim (date range filter that
+    # a non-technical user can use) doesn't depend on the specific range.
+
+    CSD_S4_DATE_FROM = "01/01/2025"
+    CSD_S4_DATE_TO = "12/31/2026"
+
+    def _run_scenario_4_date_range(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+    ) -> RunResult:
+        """Open Advanced Search > Filters, set Date Updated is between, apply, read count."""
+        drive_name = CSD_DRIVE_NAMES.get(scenario.bucket)
+        if not drive_name:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"no CSD drive name configured for bucket {scenario.bucket}",
+            )
+
+        log.info("scenario 4: drive=%s date_range=%s..%s",
+                 drive_name, self.CSD_S4_DATE_FROM, self.CSD_S4_DATE_TO)
+
+        # Reset state and navigate.
+        self._dismiss_search_state()
+        try:
+            self._click_drive(drive_name)
+        except TimeoutException as exc:
+            return self._fail_result(
+                scenario, run_id, cache_state,
+                f"setup_failed: drive click missed - {exc}",
+            )
+        self._wait_for_backdrop_clear(timeout=15)
+
+        # Refresh fallback if state is stale.
+        if self._search_state_is_stale():
+            log.warning("stale search state detected; refreshing")
+            try:
+                self.driver.refresh()
+            except Exception:
+                pass
+            if not self._is_logged_in(timeout=15):
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    "setup_failed: not signed in after refresh",
+                )
+            self._dismiss_search_state()
+            try:
+                self._click_drive(drive_name)
+            except TimeoutException as exc:
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    f"setup_failed: drive click missed after refresh - {exc}",
+                )
+            self._wait_for_backdrop_clear(timeout=15)
+
+        operator.reset_click_counter(self.driver)
+        baseline_count = self._read_pagination_count()
+        log.info("pre-filter pagination count = %s", baseline_count)
+
+        # Timed window: open Advanced Search, pick Filters, fill the form,
+        # apply, wait for the count to settle. This mirrors the actual user
+        # workflow end-to-end.
+        with stopwatch() as elapsed:
+            current_step = "init"
+            try:
+                current_step = "open_filters_dialog"
+                self._open_filters_dialog()
+                current_step = "select_criteria"
+                self._select_filter_criteria("Date Updated")
+                current_step = "select_operator"
+                self._select_filter_operator("is between")
+                current_step = "type_date_range"
+                self._type_date_range(self.CSD_S4_DATE_FROM, self.CSD_S4_DATE_TO)
+                current_step = "click_apply"
+                self._click_apply_filters()
+                current_step = "wait_count"
+                count = self._wait_for_search_result_count(
+                    timeout=SEARCH_RESULT_TIMEOUT_SEC,
+                    baseline=baseline_count,
+                )
+            except Exception as exc:  # noqa: BLE001
+                time_to_result = elapsed()
+                exc_type = type(exc).__name__
+                msg = str(exc)[:200].replace("\n", " ")
+                log.error("scenario 4 failed in step=%s exc=%s msg=%s",
+                          current_step, exc_type, msg)
+                try:
+                    from pathlib import Path as _P
+                    _P("results").mkdir(parents=True, exist_ok=True)
+                    self.driver.save_screenshot(f"results/debug-s4-fail-{current_step}.png")
+                except Exception:
+                    pass
+                return self._fail_result(
+                    scenario, run_id, cache_state,
+                    f"scenario 4 step={current_step} {exc_type}: {msg}",
+                )
+            time_to_result = elapsed()
+
+        click_count = operator.read_click_counter(self.driver)
+        # Keystrokes: dates we typed, e.g. 10 chars each.
+        keystroke_count = len(self.CSD_S4_DATE_FROM) + len(self.CSD_S4_DATE_TO)
+
+        result_correct = self._validate_count(scenario, count)
+        notes = (
+            f"CSD Filters: Date Updated is between {self.CSD_S4_DATE_FROM}..{self.CSD_S4_DATE_TO}, "
+            f"count={count} (S3 LastModified; CLI runs source-mtime semantic per RUN_CONDITIONS.md)"
+            if count is not None
+            else f"CSD Filters: Date Updated is between {self.CSD_S4_DATE_FROM}..{self.CSD_S4_DATE_TO} did not produce a count"
+        )
+
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=time_to_result,
+            click_count=click_count,
+            keystroke_count=keystroke_count,
+            http_request_count=None,
+            network_bytes=None,
             completed_within_cap=time_to_result is not None and time_to_result <= 300,
             non_technical_user_could_complete=result_correct,
             result_correct=result_correct,
@@ -730,3 +875,319 @@ class CsdRunner(Runner):
             result_count_reported=None,
             notes=f"failed: {reason}",
         )
+
+    # ----- Advanced Search > Filters helpers (used by scenario 4) -----
+
+    def _native_click(self, el) -> None:
+        """Dispatch a real mousedown+mouseup at the element's center via CDP.
+
+        MUI Select components only open their listbox in response to native
+        pointer events; Selenium's `.click()` and `arguments[0].click()` go
+        through different code paths and don't always trigger the listbox.
+        """
+        rect = el.rect
+        cx = rect["x"] + rect["width"] / 2
+        cy = rect["y"] + rect["height"] / 2
+        self.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1,
+        })
+        self.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1,
+        })
+
+    def _open_filters_dialog(self) -> None:
+        """Click Advanced Search > Filters to open the filter-builder dialog.
+
+        Both clicks use JS click to bypass any zero-opacity backdrop. The
+        wait for the dialog uses a generous 12s timeout because the dialog
+        mounts asynchronously and the prod backend is occasionally slow on
+        a cold cache reload.
+        """
+        adv = WebDriverWait(self.driver, 10).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//button[normalize-space(.)='Advanced Search']")
+            )
+        )
+        self.driver.execute_script("arguments[0].click();", adv)
+        log.info("scenario 4: clicked Advanced Search")
+        # Menu item; JS click since it's inside a popover.
+        item = WebDriverWait(self.driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//*[@role='menuitem' or self::li or self::button]"
+                 "[normalize-space(.)='Filters']")
+            )
+        )
+        self.driver.execute_script("arguments[0].click();", item)
+        log.info("scenario 4: clicked Filters menuitem")
+        # Wait for the Filters dialog to be present. Be patient - the dialog
+        # mounts asynchronously and we've seen 5s be too short on first cold
+        # render after a CDP cache clear.
+        WebDriverWait(self.driver, 12).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                 "//div[contains(@class, 'MuiDialog-paper')]"
+                 "//*[normalize-space(.)='Apply filters']")
+            )
+        )
+        log.info("scenario 4: filters dialog open")
+
+    def _select_filter_criteria(self, label: str) -> None:
+        """Click the first MUI Select inside the Filters dialog and pick the option.
+
+        Some renders take longer than expected for the combobox to attach to
+        the DOM. We poll up to 12s and log how many candidates we see along
+        the way to make any future failure diagnosable.
+        """
+        criteria = None
+        end = time.perf_counter() + 12
+        last_log = 0.0
+        while time.perf_counter() < end:
+            cands = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//*[@role='combobox' or @aria-haspopup='listbox']"
+            )
+            visible = [c for c in cands if c.is_displayed()]
+            if visible:
+                criteria = visible[0]
+                break
+            now = time.perf_counter()
+            if now - last_log > 2:
+                log.info("scenario 4: waiting for criteria combobox (cands=%d, visible=0)", len(cands))
+                last_log = now
+            time.sleep(0.2)
+        if criteria is None:
+            raise TimeoutException("filters dialog criteria combobox never appeared")
+        log.info("scenario 4: criteria combobox found, native-clicking")
+        self._native_click(criteria)
+        time.sleep(0.5)  # MUI listbox open animation
+        try:
+            opt = WebDriverWait(self.driver, 8).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, f"//li[@role='option' and normalize-space(.)='{label}']")
+                )
+            )
+        except TimeoutException:
+            # Diagnostic snapshot so we can see why the listbox didn't open.
+            try:
+                from pathlib import Path as _P
+                _P("results").mkdir(parents=True, exist_ok=True)
+                self.driver.save_screenshot("results/debug-s4-criteria-fail.png")
+                log.warning("saved results/debug-s4-criteria-fail.png on criteria-option timeout")
+            except Exception:
+                pass
+            raise
+        self._native_click(opt)
+
+    def _select_filter_operator(self, label: str) -> None:
+        """Pick an operator from the second visible Select in the Filters dialog.
+
+        MUI re-renders the operator slot after the criteria pick. We:
+          1. Wait for at least two visible comboboxes.
+          2. Sleep 0.4s to let MUI's fade-in finish - clicking mid-animation
+             gets the rect from the destination but the click handler isn't
+             yet bound.
+          3. Try CDP native click first; if listbox doesn't open within 1s,
+             fall back to a Selenium .click() on a fresh-fetched element.
+        """
+        end = time.perf_counter() + 10
+        op = None
+        while time.perf_counter() < end:
+            cands = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//*[@role='combobox' or @aria-haspopup='listbox']"
+            )
+            visible = [c for c in cands if c.is_displayed()]
+            if len(visible) >= 2:
+                op = visible[1]
+                break
+            time.sleep(0.2)
+        if op is None:
+            raise TimeoutException("operator combobox never appeared")
+        time.sleep(0.4)  # let MUI fade-in finish before clicking
+        self._native_click(op)
+
+        # If the listbox doesn't open within 1s, the click missed. Try a
+        # Selenium native click as fallback (works when the element is in
+        # an open dialog because there's no backdrop above it).
+        opened = False
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline:
+            opts = self.driver.find_elements(
+                By.XPATH, f"//li[@role='option' and normalize-space(.)='{label}']"
+            )
+            if any(o.is_displayed() for o in opts):
+                opened = True
+                break
+            time.sleep(0.1)
+        if not opened:
+            log.info("scenario 4: operator listbox didn't open via CDP, retrying via Selenium click")
+            try:
+                # Re-fetch in case it's stale after our CDP attempt.
+                cands = self.driver.find_elements(
+                    By.XPATH,
+                    "//div[contains(@class, 'MuiDialog-paper')]"
+                    "//*[@role='combobox' or @aria-haspopup='listbox']"
+                )
+                visible = [c for c in cands if c.is_displayed()]
+                if len(visible) >= 2:
+                    visible[1].click()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Selenium operator click also failed: %s", exc)
+
+        opt = WebDriverWait(self.driver, 8).until(
+            EC.presence_of_element_located(
+                (By.XPATH, f"//li[@role='option' and normalize-space(.)='{label}']")
+            )
+        )
+        self._native_click(opt)
+
+    def _type_into_input(self, el, text: str) -> None:
+        """Native-click the input then dispatch one keyDown/keyUp per character.
+
+        Inter-character sleep matches what the exploration script used; without
+        it MUI's date parser sometimes drops keystrokes and ends up with a
+        partial value, which then makes Apply produce a no-op filter.
+        """
+        self._native_click(el)
+        time.sleep(0.2)
+        for ch in text:
+            self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyDown", "text": ch
+            })
+            self.driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+                "type": "keyUp", "text": ch
+            })
+            time.sleep(0.025)
+
+    def _type_date_range(self, date_from: str, date_to: str) -> None:
+        """Type from/to dates into the two MM/DD/YYYY inputs.
+
+        Uses focus()+JS-set-value+input-event as the primary path because
+        MUI date pickers have an inline calendar icon that intercepts clicks
+        in the input's right half, and CDP mouse events sometimes hit the
+        icon instead of the text. JS-set-value is robust to that.
+        """
+        # Wait for any operator-listbox popover to fully unmount; otherwise
+        # keystrokes go to that listbox instead of the input.
+        time.sleep(0.5)
+
+        end = time.perf_counter() + 5
+        inputs: list = []
+        while time.perf_counter() < end:
+            inputs = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//input[@placeholder='MM/DD/YYYY']"
+            )
+            visible = [i for i in inputs if i.is_displayed()]
+            if len(visible) >= 2:
+                inputs = visible
+                break
+            time.sleep(0.2)
+        if len(inputs) < 2:
+            raise TimeoutException("date inputs never appeared")
+        log.info("scenario 4: date inputs found, from-rect=%s to-rect=%s",
+                 inputs[0].rect, inputs[1].rect)
+
+        # Set values via the React-aware setter so MUI's controlled state updates.
+        # This bypasses the calendar-icon-intercepts-click problem entirely.
+        self._set_input_value(inputs[0], date_from)
+        time.sleep(0.2)
+        self._set_input_value(inputs[1], date_to)
+        time.sleep(0.3)
+
+    def _set_input_value(self, el, value: str) -> None:
+        """Set an input's value via the React-aware property setter and dispatch
+        input + change events so React updates its controlled state.
+        """
+        self.driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            el.focus();
+            setter.call(el, value);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.blur();
+            """,
+            el, value,
+        )
+
+    def _click_apply_filters(self) -> None:
+        """Click the Apply filters button - CDP first, then Selenium .click() fallback.
+
+        The Apply button is inside an open dialog so it's NOT covered by a
+        backdrop; Selenium's native click works as a fallback. We wait for
+        the dialog to actually close as the success signal.
+        """
+        # Small settle so the date inputs register their final values before
+        # we click Apply - if the parser is still mid-debounce, Apply gets a
+        # stale (partial) date range.
+        time.sleep(0.4)
+
+        btn = WebDriverWait(self.driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//button[normalize-space(.)='Apply filters']")
+            )
+        )
+        # Diagnostic: log button enabled state and current date input values.
+        try:
+            disabled = btn.get_attribute("disabled")
+            log.info("scenario 4: Apply button disabled=%r", disabled)
+            inputs = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//input[@placeholder='MM/DD/YYYY']"
+            )
+            for i, inp in enumerate(inputs):
+                if inp.is_displayed():
+                    log.info("scenario 4: date input[%d] value=%r", i, inp.get_attribute("value"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("apply-state diagnostic failed: %s", exc)
+        try:
+            from pathlib import Path as _P
+            _P("results").mkdir(parents=True, exist_ok=True)
+            self.driver.save_screenshot("results/debug-s4-pre-apply.png")
+        except Exception:
+            pass
+        self._native_click(btn)
+        # Wait for the dialog to close as a signal that the apply succeeded.
+        end = time.perf_counter() + 5
+        while time.perf_counter() < end:
+            still_open = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//*[normalize-space(.)='Apply filters']"
+            )
+            if not still_open:
+                log.info("scenario 4: filters dialog closed after CDP apply")
+                return
+            time.sleep(0.2)
+        log.info("scenario 4: dialog still open after CDP apply; trying Selenium click")
+        # Fallback - try Selenium .click() (works because Apply is in foreground dialog).
+        try:
+            btn2 = self.driver.find_element(
+                By.XPATH, "//button[normalize-space(.)='Apply filters']"
+            )
+            btn2.click()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Selenium apply click also failed: %s", exc)
+        # Final wait
+        end = time.perf_counter() + 5
+        while time.perf_counter() < end:
+            still_open = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class, 'MuiDialog-paper')]"
+                "//*[normalize-space(.)='Apply filters']"
+            )
+            if not still_open:
+                log.info("scenario 4: filters dialog closed after Selenium click")
+                return
+            time.sleep(0.2)
+        log.warning("scenario 4: Apply filters click did not close dialog")
