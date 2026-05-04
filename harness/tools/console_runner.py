@@ -41,6 +41,7 @@ tag query UI.
 from __future__ import annotations
 
 import time
+from urllib.parse import quote
 
 from selenium import webdriver as sw_webdriver
 
@@ -49,13 +50,32 @@ from ..common import get_logger
 from ..config import (
     AWS_CONSOLE_BASE_URL,
     AWS_CONSOLE_CHROME_DEBUGGER_ADDRESS,
+    AWS_REGION,
     IamCreds,
+    TIMEOUT_SOFT_CAP_SEC,
 )
 from ..results import RunResult
 from ..scenarios import Scenario
 from .base import Runner
 
 log = get_logger("console_runner")
+
+
+def _console_bucket_url(bucket: str) -> str:
+    """Build the canonical S3 Console URL for a bucket's root prefix.
+
+    Uses the regional console host so the URL is stable regardless of the
+    operator's last-used region. The query params reproduce what the Console
+    sets when you navigate to a bucket from the bucket list, which matters
+    for Scenario 1 (we want every cold run starting at the same lexical
+    position, not at whatever prefix the previous run drilled into).
+    """
+    return (
+        "https://" + AWS_REGION + ".console.aws.amazon.com/s3/buckets/"
+        + quote(bucket, safe="")
+        + "?region=" + AWS_REGION
+        + "&prefix=&showversions=false"
+    )
 
 
 # Auth-state tool key. auth_state.save("console", ...) and load("console")
@@ -287,10 +307,12 @@ class ConsoleRunner(Runner):
     def run(self, scenario: Scenario, run_id: str, cache_state: str) -> RunResult:
         """Execute one run of one scenario.
 
-        Scenarios 1, 2, 3, 4 follow in their own commits. Scenario 5 always
+        Scenario 1 (this commit): navigate the Console to the flat-150k bucket
+        root, hand off to the operator, time the wait for hotkey confirmation.
+        Scenarios 2, 3, 4 follow in their own commits. Scenario 5 always
         short-circuits because the Console has no tag query UI.
         """
-        log.info("run: scenario=%s cache=%s (scaffold)", scenario.name, cache_state)
+        log.info("run: scenario=%s cache=%s", scenario.name, cache_state)
 
         if scenario.id == 5:
             return RunResult(
@@ -311,7 +333,19 @@ class ConsoleRunner(Runner):
                 ),
             )
 
-        # Scenarios 1-4: implementations land in their own commits.
+        if scenario.id == 1:
+            return self._run_find_target_via_handoff(
+                scenario=scenario,
+                run_id=run_id,
+                cache_state=cache_state,
+                page_url=_console_bucket_url(scenario.bucket),
+                target_hint=(
+                    "find file '" + (scenario.target_key or "") + "' "
+                    "(at lexical index ~149,500 of " + scenario.bucket + ")"
+                ),
+            )
+
+        # Scenarios 2, 3, 4: implementations land in their own commits.
         return RunResult(
             run_id=run_id,
             started_at="",
@@ -325,6 +359,111 @@ class ConsoleRunner(Runner):
             non_technical_user_could_complete=False,
             result_correct=False,
             notes="not yet implemented in this commit",
+        )
+
+    def _run_find_target_via_handoff(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+        page_url: str,
+        target_hint: str,
+    ) -> RunResult:
+        """Common path for find-the-file scenarios on the Console.
+
+        Drives the page to a known starting URL, resets the click counter,
+        prompts the operator, waits for the hotkey, and packages the result.
+        Used by Scenario 1 in this commit and Scenario 2 in the next.
+        """
+        if self.driver is None:
+            return RunResult(
+                run_id=run_id,
+                started_at="",
+                tool=self.name,
+                scenario_id=scenario.id,
+                scenario_name=scenario.name,
+                cache_state=cache_state,
+                operator_skill=scenario.operator_skill_by_tool[self.name],
+                time_to_result_sec=None,
+                completed_within_cap=False,
+                non_technical_user_could_complete=False,
+                result_correct=False,
+                notes="no driver attached; setup() must run before runs",
+            )
+
+        # Drive the Console to the known starting URL. The operator may have
+        # navigated elsewhere between runs; we reset the page so each run
+        # starts from the same place.
+        nav_failed_note = ""
+        try:
+            self.driver.get(page_url)
+        except Exception as exc:  # noqa: BLE001
+            nav_failed_note = (
+                "navigation to " + page_url + " failed: " + str(exc)[:200]
+            )
+            log.warning("%s", nav_failed_note)
+
+        # Re-inject the click counter on the new DOM and zero it out.
+        try:
+            operator.inject_click_counter(self.driver)
+            operator.reset_click_counter(self.driver)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not reset click counter: %s", exc)
+
+        # Operator handoff. The hotkey wait is what we time.
+        signal = operator.prompt_handoff_and_wait(
+            description=(
+                "Run " + run_id + ". Scenario " + scenario.name
+                + ". Tool=console. Cache=" + cache_state + "."
+            ),
+            target_hint=target_hint,
+            hotkey="f",
+            timeout_sec=float(TIMEOUT_SOFT_CAP_SEC),
+        )
+
+        click_count = operator.read_click_counter(self.driver) if self.driver else 0
+
+        # Per the agreed semantics: result_count_reported is 1 if the operator
+        # confirmed they saw the target, 0 otherwise. The Console doesn't
+        # surface a count for find-the-file scenarios; this is the binary
+        # we record alongside result_correct.
+        count_reported = 1 if signal.confirmed else 0
+
+        notes_parts = []
+        if nav_failed_note:
+            notes_parts.append(nav_failed_note)
+        if signal.notes:
+            notes_parts.append(signal.notes)
+        if signal.confirmed:
+            notes_parts.append(
+                "operator confirmed target visible after "
+                + format(signal.elapsed_sec, ".2f") + "s"
+            )
+        notes = "; ".join(notes_parts) if notes_parts else "ok"
+
+        completed = (
+            signal.confirmed
+            and signal.elapsed_sec <= float(TIMEOUT_SOFT_CAP_SEC)
+        )
+
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=signal.elapsed_sec if signal.confirmed else None,
+            click_count=click_count,
+            keystroke_count=None,
+            http_request_count=None,  # CDP capture lands separately
+            network_bytes=None,
+            completed_within_cap=completed,
+            non_technical_user_could_complete=signal.confirmed,
+            result_correct=signal.confirmed,
+            result_count_reported=count_reported,
+            notes=notes,
         )
 
     # ----- Internal helpers -----
