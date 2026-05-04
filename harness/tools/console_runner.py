@@ -29,6 +29,10 @@ Operator workflow per run group:
      (no MFA per RUN_CONDITIONS.md). Leave the tab open.
   3. Run the harness: python -m harness.run_matrix --tool console ...
 
+First run captures the operator's session cookies + storage to
+.local/auth/console.json. Subsequent cold-cache runs clear the browser state
+and replay that snapshot, so we never re-authenticate mid-run-group.
+
 Status: scenarios 1 and 2 land in this slice. Scenarios 3 and 4 will follow
 in their own commits. Scenario 5 short-circuits because the Console has no
 tag query UI.
@@ -40,7 +44,7 @@ import time
 
 from selenium import webdriver as sw_webdriver
 
-from .. import operator
+from .. import auth_state, operator
 from ..common import get_logger
 from ..config import (
     AWS_CONSOLE_BASE_URL,
@@ -61,6 +65,9 @@ AUTH_TOOL_KEY = "console"
 # Reasonable wait when verifying a freshly-attached tab is signed in.
 LOGGED_IN_PROBE_TIMEOUT_SEC = 10.0
 
+# Wait for the page to settle after a cold-cache reload + auth replay.
+COLD_RESET_PROBE_TIMEOUT_SEC = 15.0
+
 
 class ConsoleRunner(Runner):
     """Drive the AWS Console S3 UI by attaching to an operator-launched Chrome."""
@@ -70,6 +77,10 @@ class ConsoleRunner(Runner):
     def __init__(self, creds: IamCreds) -> None:
         self.creds = creds
         self.driver = None
+        # Whether we already have a saved auth state snapshot for this tool.
+        # Set True by setup() on first run (after capture) or when an existing
+        # snapshot is loaded. reset_cache(cold) reads this to decide whether
+        # replay is possible or whether cold should degrade to warm.
         self._auth_captured = False
 
     # ----- Setup / teardown / cache -----
@@ -81,6 +92,9 @@ class ConsoleRunner(Runner):
         and signing in. The harness only attaches and verifies the session
         looks signed in. This mirrors csd_runner.setup so the two runners
         stay in lockstep on session management.
+
+        On first run (no saved auth state), captures the operator's live
+        cookies + storage so subsequent cold-cache runs can replay them.
         """
         log.info(
             "setup: attaching to running Chrome at %s",
@@ -127,6 +141,38 @@ class ConsoleRunner(Runner):
             )
 
         operator.inject_click_counter(self.driver)
+
+        # First-run snapshot: if we don't have a saved auth state for the
+        # console yet, capture the operator's live session now so cold-cache
+        # resets can replay it. Re-capturing each setup() would be safer but
+        # also overwrites a known-good snapshot with a possibly-stale one,
+        # so we prefer "capture once, replay until it expires."
+        existing = auth_state.load(AUTH_TOOL_KEY)
+        if existing is None:
+            log.info(
+                "no saved auth state for %s; capturing the operator's live session",
+                AUTH_TOOL_KEY,
+            )
+            try:
+                state = auth_state.capture_from_driver(self.driver, AWS_CONSOLE_BASE_URL)
+                auth_state.save(AUTH_TOOL_KEY, state)
+                self._auth_captured = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "could not capture auth state for %s: %s; "
+                    "cold-cache resets will degrade to warm",
+                    AUTH_TOOL_KEY,
+                    exc,
+                )
+                self._auth_captured = False
+        else:
+            log.info(
+                "loaded existing auth state for %s (captured_at=%s)",
+                AUTH_TOOL_KEY,
+                existing.captured_at,
+            )
+            self._auth_captured = True
+
         log.info("setup complete; attached to live Chrome session")
 
     def teardown(self) -> None:
@@ -144,13 +190,97 @@ class ConsoleRunner(Runner):
     def reset_cache(self, state: str) -> None:
         """Bring the attached browser into the requested cache state.
 
-        Stub in this commit. Real cookie + storage clear and auth-replay land
-        in the next commit.
+        cold: navigate to the Console origin, clear cookies + localStorage +
+        sessionStorage, then replay the captured auth state. After replay
+        we reload and verify the session is signed-in; if not, the cold
+        snapshot is stale and we surface a loud warning so the operator
+        re-authenticates and re-captures.
+
+        warm: no-op. Page state from the previous run carries over.
         """
-        if state == "cold":
-            log.info("reset_cache(cold): NOT YET IMPLEMENTED for console runner")
-        else:
+        if self.driver is None:
+            log.warning("reset_cache(%s): no driver attached, skipping", state)
+            return
+
+        if state != "cold":
             log.info("reset_cache(warm): no-op")
+            return
+
+        if not self._auth_captured:
+            log.warning(
+                "reset_cache(cold): no captured auth state available; "
+                "skipping clear+replay so we don't sign the operator out. "
+                "This run is effectively warm-cache; the result row will "
+                "still be tagged 'cold' as the operator requested it."
+            )
+            return
+
+        log.info("reset_cache(cold): clearing browser state and replaying auth")
+
+        # 1. Navigate to the Console origin so cookies for that domain are
+        #    in scope for delete_all_cookies(). Selenium scopes cookie
+        #    deletion to the current page's origin.
+        try:
+            self.driver.get(AWS_CONSOLE_BASE_URL)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not navigate to console origin: %s", exc)
+
+        # 2. Clear cookies + storage. We swallow exceptions on the storage
+        #    clear because some Console pages briefly run on an opaque origin
+        #    where storage access throws SecurityError; the cookie clear is
+        #    the load-bearing step.
+        try:
+            self.driver.delete_all_cookies()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("delete_all_cookies failed: %s", exc)
+        try:
+            self.driver.execute_script(
+                "try { localStorage.clear(); } catch (e) {} "
+                "try { sessionStorage.clear(); } catch (e) {}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("storage clear failed: %s", exc)
+
+        # 3. Replay the captured auth state. restore_to_driver assumes we
+        #    have already navigated to the origin, which we did in step 1.
+        loaded = auth_state.load(AUTH_TOOL_KEY)
+        if loaded is None:
+            log.warning(
+                "auth state file disappeared between setup and reset; "
+                "re-run setup() or sign in again"
+            )
+            self._auth_captured = False
+            return
+        try:
+            auth_state.restore_to_driver(self.driver, loaded, AWS_CONSOLE_BASE_URL)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("restore_to_driver failed: %s", exc)
+            return
+
+        # 4. Reload so the page picks up the replayed cookies + storage and
+        #    re-injects the click counter on the fresh DOM.
+        try:
+            self.driver.get(AWS_CONSOLE_BASE_URL)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("post-replay navigation failed: %s", exc)
+
+        # 5. Verify the replay actually got us to a signed-in page. If not,
+        #    the snapshot has expired; flag _auth_captured False so future
+        #    cold resets degrade to warm with a warning rather than logging
+        #    out the operator silently.
+        if not self._is_logged_in(timeout=COLD_RESET_PROBE_TIMEOUT_SEC):
+            log.warning(
+                "cold-cache replay did not produce a signed-in session; "
+                "saved auth state for %s appears stale. Re-authenticate "
+                "manually in the Chrome window and re-run setup() to "
+                "re-capture.",
+                AUTH_TOOL_KEY,
+            )
+            self._auth_captured = False
+            return
+
+        operator.inject_click_counter(self.driver)
+        log.info("reset_cache(cold): clear + replay verified signed-in")
 
     # ----- Per-run -----
 
@@ -208,7 +338,7 @@ class ConsoleRunner(Runner):
           - the page body has rendered (non-empty innerText)
 
         We poll for up to `timeout` seconds because navigation may still be
-        completing when this is called from setup().
+        completing when this is called from setup() or reset_cache().
         """
         if self.driver is None:
             return False
