@@ -70,7 +70,14 @@ CONSOLE_INTENT_LABELS: dict[str, str] = {
 }
 
 CONSOLE_INTENT_FALLBACKS: dict[str, str] = {
-    "search-input": "input[type='search']",
+    # The bucket-listing prefix-search input. We must NOT match the
+    # AWS global "concierge" search at the top of every page, which is
+    # also input[type='search'] and has data-testid="awsc-concierge-input".
+    # Match by the placeholder text the bucket-listing input renders.
+    "search-input": (
+        "input[placeholder='Find objects by prefix'],"
+        " input[placeholder*='Find objects' i]"
+    ),
     "next-page-button": "button[data-analytics-name*='next']",
 }
 

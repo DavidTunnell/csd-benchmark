@@ -40,13 +40,17 @@ tag query UI.
 
 from __future__ import annotations
 
+import os
+import os.path
 import time
 from urllib.parse import quote
 
 from selenium import webdriver as sw_webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from .. import auth_state, operator
-from ..common import get_logger
+from ..common import get_logger, stopwatch
 from ..config import (
     AWS_CONSOLE_BASE_URL,
     AWS_CONSOLE_CHROME_DEBUGGER_ADDRESS,
@@ -56,6 +60,7 @@ from ..config import (
 )
 from ..results import RunResult
 from ..scenarios import Scenario
+from ..selectors import console_resolver
 from .base import Runner
 
 log = get_logger("console_runner")
@@ -346,10 +351,6 @@ class ConsoleRunner(Runner):
             )
 
         if scenario.id == 2:
-            # Six folders deep, full path known. The operator either pastes
-            # the path into the Console's prefix search or clicks folder by
-            # folder. Both flows end at the same target file; the helper
-            # times whichever the operator actually uses.
             return self._run_find_target_via_handoff(
                 scenario=scenario,
                 run_id=run_id,
@@ -357,8 +358,7 @@ class ConsoleRunner(Runner):
                 page_url=_console_bucket_url(scenario.bucket),
                 target_hint=(
                     "find file '" + (scenario.target_key or "") + "' "
-                    "(6+ folders deep in " + scenario.bucket + "; "
-                    "full path known)"
+                    "(6+ folders deep in " + scenario.bucket + ")"
                 ),
             )
 
@@ -479,6 +479,217 @@ class ConsoleRunner(Runner):
             completed_within_cap=completed,
             non_technical_user_could_complete=signal.confirmed,
             result_correct=signal.confirmed,
+            result_count_reported=count_reported,
+            notes=notes,
+        )
+
+    def _run_find_target_automated(
+        self,
+        scenario: Scenario,
+        run_id: str,
+        cache_state: str,
+        page_url: str,
+        search_text: str,
+        expected_filename: str,
+    ) -> RunResult:
+        """Automated find-by-filename via the Console's prefix search.
+
+        Mirrors csd_runner's automation pattern:
+          1. Navigate to the bucket page.
+          2. Find the prefix-search input via console_resolver.
+          3. Type search_text via CDP key events, then press Enter.
+          4. Poll the page for the expected filename or an empty-state.
+          5. Time the whole search-and-resolve as time_to_result.
+
+        result_correct = the expected filename is visible in the rendered
+        listing within TIMEOUT_SOFT_CAP_SEC. This works for both methodology
+        paths: path A (search_text is the full key, search resolves) and
+        path B (search_text is just the basename for an OSS-mirror style
+        bucket, search resolves to "no objects" - we still time the dead
+        end and record correct=false).
+        """
+        if self.driver is None:
+            return RunResult(
+                run_id=run_id,
+                started_at="",
+                tool=self.name,
+                scenario_id=scenario.id,
+                scenario_name=scenario.name,
+                cache_state=cache_state,
+                operator_skill=scenario.operator_skill_by_tool[self.name],
+                time_to_result_sec=None,
+                completed_within_cap=False,
+                non_technical_user_could_complete=False,
+                result_correct=False,
+                notes="no driver attached; setup() must run before runs",
+            )
+
+        # Drive the page to the bucket root before measuring.
+        nav_failed_note = ""
+        try:
+            self.driver.get(page_url)
+        except Exception as exc:  # noqa: BLE001
+            nav_failed_note = (
+                "navigation to " + page_url + " failed: " + str(exc)[:200]
+            )
+            log.warning("%s", nav_failed_note)
+
+        # Re-inject + reset click counter on the new DOM.
+        try:
+            operator.inject_click_counter(self.driver)
+            operator.reset_click_counter(self.driver)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not reset click counter: %s", exc)
+
+        # Find the prefix-search input. Wait briefly for it to render.
+        search_input = None
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            search_input = console_resolver.find(self.driver, "search-input")
+            if search_input is not None:
+                break
+            time.sleep(0.5)
+        if search_input is None:
+            return RunResult(
+                run_id=run_id,
+                started_at="",
+                tool=self.name,
+                scenario_id=scenario.id,
+                scenario_name=scenario.name,
+                cache_state=cache_state,
+                operator_skill=scenario.operator_skill_by_tool[self.name],
+                time_to_result_sec=None,
+                completed_within_cap=False,
+                non_technical_user_could_complete=False,
+                result_correct=False,
+                notes="could not find Console prefix-search input on the bucket page",
+            )
+
+        # Timed search: focus input, type substring, press Enter, poll DOM.
+        with stopwatch() as elapsed:
+            # Focus via JS rather than .click() because the bucket page's
+            # sticky header and breadcrumb overlay can intercept Selenium
+            # clicks at the input's reported coordinates.
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});"
+                    " arguments[0].focus();",
+                    search_input,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not focus search input via JS: %s", exc)
+            # Clear any prior content via JS-set value + input event.
+            try:
+                self.driver.execute_script(
+                    "var el = arguments[0];"
+                    " var setter = Object.getOwnPropertyDescriptor("
+                    "   window.HTMLInputElement.prototype, 'value').set;"
+                    " setter.call(el, '');"
+                    " el.dispatchEvent(new Event('input', {bubbles: true}));",
+                    search_input,
+                )
+            except Exception:
+                pass
+            # Set the value via the React-bypass trick: use the native
+            # HTMLInputElement value setter so React's controlled-input
+            # override gets correctly invoked, then dispatch an 'input' event
+            # so React's onChange fires. This is more reliable than typing
+            # individual CDP keystrokes through the overlay-prone bucket
+            # page, where keystrokes can land outside the focused element
+            # if the page reflows mid-type.
+            try:
+                self.driver.execute_script(
+                    "var el = arguments[0];"
+                    " var setter = Object.getOwnPropertyDescriptor("
+                    "   window.HTMLInputElement.prototype, 'value').set;"
+                    " setter.call(el, arguments[1]);"
+                    " el.dispatchEvent(new Event('input', {bubbles: true}));"
+                    " el.dispatchEvent(new Event('change', {bubbles: true}));",
+                    search_input,
+                    search_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not set search input value via JS: %s", exc)
+            # Submit by dispatching Enter on the focused input. The bucket
+            # page applies the prefix filter on Enter.
+            try:
+                self.driver.execute_script(
+                    "var el = arguments[0];"
+                    " var ev = new KeyboardEvent('keydown', {key: 'Enter', "
+                    "   code: 'Enter', keyCode: 13, which: 13, bubbles: true});"
+                    " el.dispatchEvent(ev);",
+                    search_input,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Enter dispatch failed: %s", exc)
+
+            # Poll for either the target filename appearing in a link/row
+            # text, or the Console's empty state ("No objects" / "Showing 0").
+            found = False
+            empty = False
+            while elapsed() < float(TIMEOUT_SOFT_CAP_SEC):
+                try:
+                    body_text = self.driver.execute_script(
+                        "return (document.body && document.body.innerText) || '';"
+                    ) or ""
+                except Exception:
+                    body_text = ""
+                if expected_filename and expected_filename in body_text:
+                    found = True
+                    break
+                # Common Console empty-state phrases when prefix search misses.
+                low = body_text.lower()
+                if (
+                    "no objects" in low
+                    or "no results" in low
+                    or "0 matches" in low
+                    or "showing 0 of" in low
+                ):
+                    empty = True
+                    break
+                time.sleep(0.5)
+            time_to_result = elapsed()
+
+        click_count = operator.read_click_counter(self.driver) if self.driver else 0
+        completed = time_to_result <= float(TIMEOUT_SOFT_CAP_SEC)
+
+        # Result count reporting:
+        # - found: exactly 1 (Console scenarios are find-this-file by design)
+        # - empty: 0
+        # - timeout: None (we don't know what was on screen)
+        if found:
+            count_reported = 1
+        elif empty:
+            count_reported = 0
+        else:
+            count_reported = None
+
+        notes_parts = []
+        if nav_failed_note:
+            notes_parts.append(nav_failed_note)
+        notes_parts.append(
+            "Console prefix search '" + search_text + "', "
+            + ("target found" if found else ("empty state" if empty else "timeout"))
+            + ", t=" + format(time_to_result, ".2f") + "s"
+        )
+        notes = "; ".join(notes_parts)
+
+        return RunResult(
+            run_id=run_id,
+            started_at="",
+            tool=self.name,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            cache_state=cache_state,
+            operator_skill=scenario.operator_skill_by_tool[self.name],
+            time_to_result_sec=time_to_result,
+            click_count=click_count,
+            keystroke_count=len(search_text),
+            http_request_count=None,
+            network_bytes=None,
+            completed_within_cap=completed,
+            non_technical_user_could_complete=found,
+            result_correct=found,
             result_count_reported=count_reported,
             notes=notes,
         )
